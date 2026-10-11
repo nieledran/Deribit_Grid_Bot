@@ -508,7 +508,7 @@ void Window::submit(const Action& a) {
             } else {
                 const auto root = r.value.toObject(); const auto order = root.contains("order") ? root["order"].toObject() : root;
                 receiveOrder(order, true); receiveTrades(root["trades"].toArray()); save();
-                if (a.role == Role::Take) QTimer::singleShot(0, this, &Window::pump);
+                QTimer::singleShot(0, this, &Window::pump);
             }
             render();
         } catch (const std::exception& e) { engine.uncertain(a.label); save(); log(QString::fromUtf8(e.what())); ready = false; synchronize(); }

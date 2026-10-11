@@ -27,6 +27,7 @@ private slots:
         { Store db(path); db.save(seed); }
         QHash<QString, QJsonObject> orders; QStringList stateReads, cancelled; QList<qint64> takeLatencies;
         int openReads = 0, tickerReads = 0; qint64 timestamp = 1; double externalChange = 0;
+        bool overlappingMutations = false;
         QElapsedTimer protectionClock; QWebSocket* peer = nullptr; QJsonObject delayedFill;
         bool deliverDelayedFill = false, recovering = false;
         const auto publish = [&](const QJsonArray& events, const QJsonArray& trades = QJsonArray{}) {
@@ -56,6 +57,11 @@ private slots:
             peer = server.nextPendingConnection(); peer->setParent(&server);
             connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
                 const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString(); const auto p = j["params"].toObject();
+                if (method == "private/buy" || method == "private/sell" || method == "private/edit" || method == "private/cancel") {
+                    const auto e = saved();
+                    if (std::count_if(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation != Mutation::None; }) != 1)
+                        overlappingMutations = true;
+                }
                 if (recovering) qInfo() << instrument << "recovery ms:" << protectionClock.elapsed() << method;
                 QJsonValue result = QJsonObject{{"ok", true}};
                 if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
@@ -102,11 +108,24 @@ private slots:
         window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake");
         window.findChild<QPushButton*>("connect")->click();
         QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text(), QString("Connected"), 5000);
-        QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled()); window.findChild<QPushButton*>("start")->click();
+        QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled());
+        QElapsedTimer placementClock; placementClock.start(); window.findChild<QPushButton*>("start")->click();
         QTRY_COMPARE_WITH_TIMEOUT(orders.size(), 28, 18000);
         QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 1000);
+        const auto placementMs = placementClock.elapsed();
+        QVERIFY2(placementMs < 7000, "Entry placement still waits for the 400 ms pump timer");
+
+        // A full rebuild must pace both cancellation and replacement by replies, with one pending mutation.
+        QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled());
+        placementClock.restart(); window.findChild<QPushButton*>("start")->click();
+        QTRY_COMPARE_WITH_TIMEOUT(orders.size(), 56, 12000);
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 1000);
+        const auto rebuildMs = placementClock.elapsed();
+        QCOMPARE(cancelled.size(), 28); QVERIFY2(rebuildMs < 10000, "Rebuild cancellation/replacement still waits for the pump timer");
+        QVERIFY(!overlappingMutations); cancelled.clear();
+        qInfo() << instrument << "28 entries ms:" << placementMs << "28 cancels + 28 replacement entries ms:" << rebuildMs;
         QStringList shorts;
-        for (auto i = orders.cbegin(); i != orders.cend(); ++i) if (i.value()["direction"] == "sell") shorts.append(i.key());
+        for (auto i = orders.cbegin(); i != orders.cend(); ++i) if (i.value()["direction"] == "sell" && i.value()["order_state"] == "open") shorts.append(i.key());
         std::sort(shorts.begin(), shorts.end(), [&](const QString& a, const QString& b) { return orders[a]["price"].toDouble() < orders[b]["price"].toDouble(); });
         QCOMPARE(shorts.size(), 14); QCOMPARE(saved().availableSlots(Side::Short), 14);
         QVERIFY(settleAccountRead());
