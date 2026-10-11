@@ -1,0 +1,8 @@
+.deps/
+.vs/
+build/
+dist/
+profiles/
+*.db*
+*.lock
+aqtinstall.log
