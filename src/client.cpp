@@ -31,6 +31,11 @@ Client::Client(QObject* parent) : QObject(parent) {
     });
     watchdog.start();
 }
+Client::~Client() {
+    // The socket is destroyed after the callback containers. Shut it down while they still exist.
+    QObject::disconnect(&socket, nullptr, this, nullptr);
+    stop();
+}
 void Client::connectTo(const QString& id, const QString& secret, bool production, const QUrl& testEndpoint) {
     stop(); clientId = id; clientSecret = secret; wanted = true; retryMs = 1500;
     endpoint = testEndpoint.isEmpty() ? QUrl(production ? "wss://www.deribit.com/ws/api/v2" : "wss://test.deribit.com/ws/api/v2") : testEndpoint;

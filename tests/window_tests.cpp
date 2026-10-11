@@ -22,9 +22,9 @@ private slots:
         Engine seed; seed.profileId = "preservetakes"; seed.config.instrument = "ETH_USDC-PERPETUAL";
         seed.spec = {Scale / 100, Scale / 10000, {}}; seed.externalPosition = 4000000;
         seed.config.longs = {2480 * Scale, 2500 * Scale, 100 * Dollars, 2}; seed.config.shorts = {2500 * Scale, 2520 * Scale, 100 * Dollars, 2};
-        seed.cycles.push_back({seed.nextCycle++, 7, Side::Short, 2506 * Scale, 2504 * Scale, 40, 40, true});
+        seed.importCycle({seed.nextCycle++, 7, Side::Short, 2506 * Scale, 2504 * Scale, 40, 40, true});
         Order saved; saved.label = "dg_preservetakes_1_t_1"; saved.exchangeId = "existing-bot-take"; saved.cycle = 1;
-        saved.role = Role::Take; saved.price = 2504 * Scale; saved.total = 40; saved.status = Status::Open; seed.orders.push_back(saved); seed.nextOrder = 2;
+        saved.role = Role::Take; saved.price = 2504 * Scale; saved.total = 40; saved.status = Status::Open; seed.importOrder(saved); seed.nextOrder = 2;
         { Store db(path); db.save(seed); }
         const QJsonObject manual{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"order_id", "USDC-210049237502281438"}, {"label", "manual"},
             {"order_type", trigger ? "take_market" : "limit"}, {"order_state", trigger ? "untriggered" : "open"}, {"direction", "sell"},
@@ -84,7 +84,7 @@ private slots:
         seed.spec = {Scale / 100, Scale / 10000, {}};
         seed.config.longs = {2480 * Scale, 2500 * Scale, 1000 * Dollars, 10};
         seed.config.shorts = {2500 * Scale, 2520 * Scale, 1000 * Dollars, 10};
-        for (int i = 0; i < 3; ++i) seed.cycles.push_back({seed.nextCycle++, 7, Side::Long, 2500 * Scale - (i + 1) * Scale / 5, 2500 * Scale - i * Scale / 5, 40, 40, true});
+        for (int i = 0; i < 3; ++i) seed.importCycle({seed.nextCycle++, 7, Side::Long, 2500 * Scale - (i + 1) * Scale / 5, 2500 * Scale - i * Scale / 5, 40, 40, true});
         { Store db(path); db.save(seed); }
         QWebSocketServer server("Manual flatten", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         int tradingCalls = 0;
@@ -114,7 +114,7 @@ private slots:
         QVERIFY(window.findChild<QPushButton*>("resetHistory")->isEnabled());
         QTimer::singleShot(0, [] { if (auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) dialog->button(QMessageBox::Yes)->click(); });
         window.findChild<QPushButton*>("resetHistory")->click();
-        QTRY_VERIFY_WITH_TIMEOUT(([&] { Store db(path); Engine cleared; db.load(cleared); return cleared.cycles.empty() && !cleared.positionBlocked; })(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { Store db(path); Engine cleared; db.load(cleared); return cleared.cycles().empty() && !cleared.positionBlocked; })(), 5000);
         QCOMPARE(tradingCalls, 0); window.close();
     }
     void pauseProtectsAFillRacingCancellation_data() {
@@ -147,7 +147,7 @@ private slots:
         };
         QWebSocket* peer = nullptr;
         if (recover) {
-            const auto& o = seed.orders[0];
+            const auto& o = seed.orders()[0];
             entry = QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"}, {"order_type", "limit"}, {"order_state", "open"}, {"direction", isLong ? "buy" : "sell"},
                 {"label", QString::fromStdString(o.label)}, {"order_id", "entry-1"}, {"price", static_cast<double>(o.price) / Scale},
                 {"amount", static_cast<double>(o.total) / 10000}, {"filled_amount", 0.0003}, {"last_update_timestamp", 1}};
@@ -195,11 +195,11 @@ private slots:
             QTRY_COMPARE_WITH_TIMEOUT(takes, 1, 5000); QCOMPARE(entries, 1);
             window.findChild<QPushButton*>("pause")->click();
             QTRY_COMPARE_WITH_TIMEOUT(edits, 1, 5000);
-        } else { QTRY_COMPARE_WITH_TIMEOUT(takes, 1, 5000); QCOMPARE(edits, 0); }
+        } else { QTRY_COMPARE_WITH_TIMEOUT(takes, 1, 5000); QTRY_COMPARE_WITH_TIMEOUT(edits, 1, 5000); }
         QVERIFY(limitsOnly); QCOMPARE(cancellations, 1); QCOMPARE(take["amount"].toDouble(), 0.0004);
         QTest::qWait(100);
         Engine restored; { Store db(path); QVERIFY(db.load(restored)); }
-        QCOMPARE(restored.cycles[0].held, Int(4)); QVERIFY(restored.settled()); QVERIFY(!restored.running);
+        QCOMPARE(restored.cycles()[0].held, Int(4)); QVERIFY(restored.settled()); QVERIFY(!restored.running);
         QCOMPARE(takes, 1); QCOMPARE(entries, recover ? 0 : 1);
         auto* stats = window.findChild<QLabel*>("sessionStats"); QVERIFY(stats);
         QVERIFY(!window.findChild<QPushButton*>("resetHistory")->isEnabled());
@@ -241,7 +241,7 @@ private slots:
         QTRY_VERIFY(window.findChild<QPushButton*>("resetHistory")->isEnabled());
         QTimer::singleShot(0, [] { if (auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) dialog->button(QMessageBox::Yes)->click(); });
         window.findChild<QPushButton*>("resetHistory")->click();
-        QTRY_VERIFY_WITH_TIMEOUT(([&] { Store db(path); Engine cleared; db.load(cleared); return cleared.cycles.empty() && cleared.orders.empty(); })(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { Store db(path); Engine cleared; db.load(cleared); return cleared.cycles().empty() && cleared.orders().empty(); })(), 5000);
         { Store db(path); QVERIFY(db.load(restored)); }
         QVERIFY(restored.externalPosition.has_value()); QCOMPARE(*restored.externalPosition, recover ? Int(0) : Int(-40000));
         QVERIFY(restored.nextOrder >= nextOrder); QVERIFY(!restored.running);

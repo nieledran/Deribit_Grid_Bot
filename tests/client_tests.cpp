@@ -6,6 +6,21 @@
 class ClientTests : public QObject {
     Q_OBJECT
 private slots:
+    void destructionWithPendingRequests() {
+        QWebSocketServer server("Destruction simulator", QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QWebSocket* peer = nullptr;
+        connect(&server, &QWebSocketServer::newConnection, this, [&] { peer = server.nextPendingConnection(); peer->setParent(&server); });
+        bool callback = false;
+        {
+            Client client;
+            client.connectTo("fake", "fake-secret", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+            QTRY_VERIFY(peer);
+            client.call("pending/read", {}, [&](const RpcResult&) { callback = true; });
+            // Deliberately destroy without an explicit stop and with a live socket/auth callback.
+        }
+        QTest::qWait(50); QVERIFY(!callback);
+    }
     void correlationHeartbeatAndLostMutation() {
         QWebSocketServer server("Fake Deribit", QWebSocketServer::NonSecureMode);
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));

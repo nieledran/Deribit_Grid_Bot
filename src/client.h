@@ -20,6 +20,7 @@ class Client : public QObject {
 public:
     using Callback = std::function<void(const RpcResult&)>;
     explicit Client(QObject* parent = nullptr);
+    ~Client() override;
     void connectTo(const QString& id, const QString& secret, bool production, const QUrl& testEndpoint = {});
     void stop();
     qint64 call(const QString& method, const QJsonObject& params, Callback callback, bool mutation = false);

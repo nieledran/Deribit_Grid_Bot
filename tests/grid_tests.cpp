@@ -19,11 +19,25 @@ Engine setup(int n = 10, bool both = false) {
 Update snapshot(const Order& o, Int filled, bool terminal = false, Int time = 1) {
     return {o.label, o.exchangeId.empty() ? "ex-" + o.label : o.exchangeId, o.total, filled, time, o.price, terminal};
 }
+void verifyTotals(const Engine& e) {
+    for (const auto side : {Side::Long, Side::Short}) {
+        Int reserved = 0; int occupied = 0, positioned = 0;
+        for (const auto& c : e.cycles()) if (c.side == side) {
+            Int lots = c.retired ? c.held : c.capacity; bool live = false;
+            for (const auto& o : e.orders()) if (o.cycle == c.id) { live |= o.live(); if (c.retired && o.role == Role::Entry) lots += o.remaining(); }
+            reserved += e.nominal(lots, c.entry); occupied += !c.retired || c.held > 0 || live; positioned += c.held > 0;
+        }
+        check(e.used(side) == reserved, "Cached budget equals independent full traversal");
+        check(e.occupiedSlots(side) == occupied, "Cached allocation equals independent full traversal");
+        const auto& b = side == Side::Long ? e.config.longs : e.config.shorts;
+        check(e.availableSlots(side) == std::max(0, b.levels - positioned), "Cached position slots equal full traversal");
+    }
+}
 void ack(Engine& e, const Action& a, Int filled = 0, bool terminal = false, Int time = 1) {
     auto o = *e.order(a.label);
     if (a.kind == Mutation::Edit) o.total = a.total;
     auto u = snapshot(o, filled, terminal || a.kind == Mutation::Cancel, time);
-    e.apply(u); e.resolved(a.label);
+    e.apply(u); e.resolved(a.label); verifyTotals(e);
 }
 Action requireAction(Engine& e, Mutation kind, Role role) {
     auto a = e.nextAction(); check(a.has_value(), "Expected an action");
@@ -40,7 +54,7 @@ void pricesAndCaps() {
     auto e = setup(10, true); auto a = requireAction(e, Mutation::Create, Role::Entry);
     check(!a.buy && a.price == p(85140), "Short grid first price must be 85140");
     check(e.lattice.size() == 20 && e.lattice[9].entry == p(90000) && e.lattice.back().entry == p(80000), "Both lattices must cover their ranges");
-    check(e.cycles.front().take == p(84600), "First take must be the anchor");
+    check(e.cycles().front().take == p(84600), "First take must be the anchor");
     ack(e, a);
     auto opposite = requireAction(e, Mutation::Create, Role::Entry);
     check(opposite.buy, "Second placement starts the other grid immediately"); ack(e, opposite);
@@ -58,16 +72,16 @@ void partialAndDuplicate() {
     check(o.total >= 4, "Test needs several lots");
     e.apply(snapshot(o, 2, false, 2)); e.apply(snapshot(o, 2, false, 2));
     e.apply(snapshot(o, 1, false, 1));
-    check(e.cycles[0].held == 2, "Duplicate and stale fills must be ignored");
+    check(e.cycles()[0].held == 2, "Duplicate and stale fills must be ignored");
     auto take = requireAction(e, Mutation::Create, Role::Take);
     check(take.buy && take.total == 2, "Take must protect exactly the filled lots"); ack(e, take);
     e.apply(snapshot(o, 4, false, 3));
     auto edit = requireAction(e, Mutation::Edit, Role::Take); check(edit.total == 4, "Aggregate another partial fill");
     ack(e, edit, 1, false, 4);
-    check(e.cycles[0].held == 3, "Partial take decreases inventory");
+    check(e.cycles()[0].held == 3, "Partial take decreases inventory");
     e.pause(); auto cancel = requireAction(e, Mutation::Cancel, Role::Entry);
     ack(e, cancel, 5, false, 5);
-    check(e.cycles[0].held == 4, "A fill racing cancellation must be counted");
+    check(e.cycles()[0].held == 4, "A fill racing cancellation must be counted");
     edit = requireAction(e, Mutation::Edit, Role::Take);
     check(edit.total == 5, "Edit total includes already filled take quantity"); ack(e, edit, 1, false, 6);
     check(e.settled(), "Paused inventory must be protected");
@@ -91,7 +105,7 @@ void rebuildAndOldSlots() {
     auto next = e.config; next.shorts.levels = 3;
     e.requestRebuild(next);
     auto fresh = requireAction(e, Mutation::Create, Role::Entry); ack(e, fresh);
-    check(e.cycles[0].retired && e.cycles[0].take == take.price, "Old take must stay fixed");
+    check(e.cycles()[0].retired && e.cycles()[0].take == take.price, "Old take must stay fixed");
     check(e.lattice.size() == 3 && e.occupiedSlots(Side::Short) == 2, "Old cycle consumes one of new slots");
     fresh = requireAction(e, Mutation::Create, Role::Entry); ack(e, fresh);
     check(!e.nextAction() && e.occupiedSlots(Side::Short) == 3, "No extra slots while old take is open");
@@ -109,7 +123,7 @@ void limitsAndUncertainty() {
     e = setup(); entry = requireAction(e, Mutation::Create, Role::Entry);
     e.uncertain(entry.label); check(!e.nextAction(), "Unknown placement may not be retried");
     e.disconnected(); check(!e.nextAction(), "Disconnect freezes mutations until reconciliation");
-    ack(e, entry); check(e.orders.size() == 1, "Reconciliation must not duplicate the original order");
+    ack(e, entry); check(e.orders().size() == 1, "Reconciliation must not duplicate the original order");
 }
 void switchingAndConflicts() {
     auto e = setup(2, true); auto entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry);
@@ -120,14 +134,20 @@ void switchingAndConflicts() {
     e.quote(p(79999.9), p(80000.1));
     e.pause(); completePause(e);
     e = setup(1); entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry, 1, false);
-    e.foreign.push_back({"manual", false, e.cycles[0].take});
+    e.foreign.push_back({"manual", false, e.cycles()[0].take});
     check(!e.nextAction() && !e.problem.empty(), "Manual order blocks crossing take");
     check(e.foreign[0].id == "manual", "Manual orders are untouched");
     e.foreign.clear(); auto take = requireAction(e, Mutation::Create, Role::Take); ack(e, take);
     e.cancelAll(); completePause(e); check(e.settled(), "Cancel-all must stop both roles");
-    check(e.cycles[0].held == 1, "Cancel-all must not close the position");
+    check(e.cycles()[0].held == 1, "Cancel-all must not close the position");
 }
 void denseAndGap() {
+    auto bounded = setup(2, true); bounded.config.longs.high = p(84500.05); bounded.config.shorts.low = p(84500.05);
+    bounded.requestRebuild(bounded.config); auto boundedAction = bounded.nextAction(); check(boundedAction.has_value(), "Non-tick band edges still yield valid levels");
+    for (const auto& l : bounded.lattice) {
+        const auto& b = l.side == Side::Long ? bounded.config.longs : bounded.config.shorts;
+        check(l.entry >= b.low && l.entry <= b.high && l.take >= b.low && l.take <= b.high, "Entries and takes both stay inside non-tick bounds");
+    }
     auto e = setup(); e.config.shorts = {p(84500), p(84600.2), 850 * Dollars, 10};
     e.requestRebuild(e.config); check(!e.nextAction() && e.blocked, "Tick-collapsed grids are blocked");
     auto c = setup(2, true).config; c.longs.high = p(84000); c.shorts.low = p(85000);
@@ -138,28 +158,115 @@ void denseAndGap() {
 }
 void simultaneousGridsSurviveFastQuotes() {
     auto e = setup(3, true);
-    e.config.longs.high = p(82900); e.config.shorts = {p(82900), p(85000), 850 * Dollars, 3};
-    e.quote(p(82905.9), p(82906.1)); e.requestRebuild(e.config);
     for (int i = 0; i < 6; ++i) { auto a = requireAction(e, Mutation::Create, Role::Entry); ack(e, a); }
-    check(e.occupiedSlots(Side::Short) == 3 && e.occupiedSlots(Side::Long) == 3, "Both grids exist before crossing the boundary");
-    const auto generation = e.generation; const auto orderCount = e.orders.size();
-    for (const double mid : {82899.0, 82906.0, 82000.0, 85001.0, 79000.0, 82900.0, 82899.0, 82906.0}) {
-        e.quote(p(mid - 0.1), p(mid + 0.1));
-        check(!e.rebuilding && e.generation == generation, "Rapid quotes must not change grid generation");
-        check(!e.nextAction() && e.orders.size() == orderCount, "Range crossings must not cancel or replace resting entries");
-        for (const auto& o : e.orders) check(o.live(), "Both grids keep their existing entries");
+    const auto generation = e.generation;
+    e.quote(p(84000), p(84000));
+    check(!e.rebuilding, "Approaching movement smaller than the short step retains the grid");
+    e.quote(p(82700), p(82700));
+    check(e.rebuilding, "Short grid follows a full step down");
+    auto cancel = requireAction(e, Mutation::Cancel, Role::Entry);
+    check(!cancel.buy, "Automatic short rebuild never cancels long entries"); ack(e, cancel, 0, false, 2);
+    e.quote(p(82700.1), p(82700.1));
+    check(!e.rebuilding && e.generation == generation, "One tick reversal aborts transfer before committing new levels");
+    auto restore = requireAction(e, Mutation::Create, Role::Entry);
+    check(restore.price == cancel.price && !restore.buy, "Cancelled entry is restored at the previous price"); ack(e, restore);
+    e.quote(p(82700), p(82700));
+    for (int i = 0; i < 2; ++i) { cancel = requireAction(e, Mutation::Cancel, Role::Entry); check(!cancel.buy, "Only moving side is cancelled"); ack(e, cancel, 0, false, 10 + i); }
+    auto fresh = requireAction(e, Mutation::Create, Role::Entry); check(!fresh.buy, "Rebuild places the new short grid"); ack(e, fresh);
+    check(e.generation == generation + 1, "Step move commits one generation");
+    for (const auto& l : e.lattice) check(l.entry >= (l.side == Side::Long ? e.config.longs.low : e.config.shorts.low) &&
+        l.entry <= (l.side == Side::Long ? e.config.longs.high : e.config.shorts.high), "Rebuilt levels remain in range");
+    const auto preview = e.preview(e.config); check(preview.lattice.size() == 6, "Preview has both grids");
+}
+void autoRebuildProtectsRacedFills() {
+    Engine e; e.profileId = "race"; e.spec = {p(0.1), p(0.0001), {}};
+    e.config.longs = {p(2400), p(2500), 100 * Dollars, 2}; e.quote(p(2450), p(2450)); e.requestRebuild(e.config);
+    const auto first = requireAction(e, Mutation::Create, Role::Entry); ack(e, first);
+    const auto endpoint = requireAction(e, Mutation::Create, Role::Entry); ack(e, endpoint);
+    const auto generation = e.generation;
+    e.quote(p(2474.9), p(2474.9)); check(!e.rebuilding, "Long waits for a complete step");
+    e.quote(p(2475), p(2475)); check(e.rebuilding, "Long follows one step upwards");
+    auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); check(cancel.label == first.label, "Unchanged endpoint is retained");
+    ack(e, cancel, 1, true, 2);
+    auto take = requireAction(e, Mutation::Create, Role::Take);
+    check(e.generation == generation && take.total == 1 && take.price == p(2450), "Raced fill is protected at old take before committing grid"); ack(e, take);
+    check(!e.nextAction() && e.generation == generation + 1, "Held old slot and unchanged endpoint reserve the new grid capacity");
+    check(e.order(endpoint.label)->live() && e.order(take.label)->price == p(2450), "Unchanged entry and existing take are preserved");
+    e.apply(snapshot(*e.order(take.label), 1, true, 4)); verifyTotals(e);
+    const auto fresh = requireAction(e, Mutation::Create, Role::Entry);
+    check(fresh.price == p(2437.5), "New freed slot uses the latest long anchor");
+    e.disconnected(); check(!e.running && !e.nextAction(), "Connection loss has priority over grid transfer");
+    Engine slots; slots.profileId = "slots"; slots.spec = e.spec; slots.config.longs = e.config.longs; slots.config.longs.levels = 14;
+    check(slots.availableSlots(Side::Long) == 14, "Initial display is 14/14");
+    for (int i = 0; i < 4; ++i) {
+        const auto id = slots.nextCycle++; slots.importCycle({id, 0, Side::Long, p(2400), p(2450), 1, 1, true});
+        Order o; o.label = "slot" + std::to_string(id); o.exchangeId = o.label; o.cycle = id; o.role = Role::Take;
+        o.price = p(2450); o.total = 1; o.status = Status::Open; slots.importOrder(o);
     }
-    const auto preview = e.preview(e.config);
-    check(preview.lattice.size() == 6 && e.generation == generation && e.orders.size() == orderCount, "Preview shows both sides without modifying live state");
-    e.pause(); completePause(e); check(e.settled(), "Pause cancels entries of both grids");
+    check(slots.availableSlots(Side::Long) == 10, "Four old positioned cycles display 10/14");
+    for (int i = 1; i <= 4; ++i) slots.apply(snapshot(*slots.order("slot" + std::to_string(i)), 1, true, 1));
+    check(slots.availableSlots(Side::Long) == 14, "Closing all old cycles restores 14/14"); verifyTotals(slots);
+}
+void lateFillAfterGridCommit() {
+    auto e = setup(2); auto first = requireAction(e, Mutation::Create, Role::Entry); ack(e, first);
+    auto endpoint = requireAction(e, Mutation::Create, Role::Entry); ack(e, endpoint);
+    e.quote(p(81900), p(81900)); auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); ack(e, cancel, 0, true, 2);
+    auto replacement = requireAction(e, Mutation::Create, Role::Entry); ack(e, replacement);
+    auto old = *e.order(first.label); e.apply(snapshot(old, 1, true, 3)); e.apply(snapshot(old, 1, true, 3));
+    auto take = requireAction(e, Mutation::Create, Role::Take); check(take.total == 1, "Late archived-generation fill is protected exactly once"); ack(e, take);
+    cancel = requireAction(e, Mutation::Cancel, Role::Entry);
+    check(cancel.label == replacement.label, "A late position displaces excess new opening capacity"); ack(e, cancel, 0, true, 4);
+    check(e.occupiedSlots(Side::Short) <= 2 && e.used(Side::Short) <= e.config.shorts.budget, "Late fill returns allocations to the configured caps"); verifyTotals(e);
+}
+void malformedIdentityDoesNotMutateInventory() {
+    auto e = setup(2); auto first = requireAction(e, Mutation::Create, Role::Entry); ack(e, first);
+    auto second = requireAction(e, Mutation::Create, Role::Entry); const auto order = *e.order(second.label);
+    bool refused = false;
+    try { e.apply({order.label, e.order(first.label)->exchangeId, order.total, 1, 2, order.price, false}); }
+    catch (const std::exception&) { refused = true; }
+    check(refused && e.cycle(order.cycle)->held == 0 && e.order(order.label)->exchangeId.empty(), "Duplicate exchange identity is rejected before changing inventory");
+    e.uncertain(order.label); check(!e.nextAction(), "Malformed outcome remains frozen for reconciliation"); verifyTotals(e);
+}
+void lateFillAfterRestoringSameCycle() {
+    auto e = setup(1); auto original = requireAction(e, Mutation::Create, Role::Entry); ack(e, original);
+    e.pause(); auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); ack(e, cancel, 0, true, 2);
+    // Reversal/resume restores the same free cycle before the old final fill is reported.
+    e.running = true;
+    auto restored = requireAction(e, Mutation::Create, Role::Entry); ack(e, restored, restored.total, true, 3);
+    const auto old = *e.order(original.label); e.apply(snapshot(old, 1, true, 4)); e.apply(snapshot(old, 1, true, 4));
+    const auto* c = e.cycle(old.cycle);
+    check(c->held == restored.total + 1 && c->retired && c->capacity == c->held, "Overlapping legitimate entry fills are counted and made close-only");
+    const auto take = requireAction(e, Mutation::Create, Role::Take);
+    check(take.total == restored.total + 1, "Take protects every lot despite late restore race"); verifyTotals(e);
+}
+void exactArithmeticAndSlots() {
+    auto e = setup(14);
+    check(e.nominal(1, p(82500)) == 8250000, "MSVC exact 8.25 USDC notional");
+    check(e.lotsFor(8250000, p(82500)) == 1, "Exact budget purchases one lot");
+    check(e.lotsFor(305250370, p(82500.1)) == 37, "Exact boundary purchases 37 lots");
+    std::uint64_t rng = 1234567;
+    for (int i = 0; i < 10000; ++i) {
+        rng = rng * 6364136223846793005ULL + 1;
+        const Int price = Int(rng % 10000000000000ULL) + 1;
+        const Int budget = Int((rng >> 16) % 10000000000ULL) + 1;
+        const Int lots = e.lotsFor(budget, price);
+        check(e.nominal(lots, price) <= budget && e.nominal(lots + 1, price) > budget, "Maximal lots fit; next lot exceeds budget");
+    }
+    bool overflow = false; try { e.nominal(INT64_MAX, INT64_MAX); } catch (const std::exception&) { overflow = true; }
+    check(overflow, "Notional overflow is rejected");
+    check(e.availableSlots(Side::Short) == 14, "Unfilled entries do not consume position slots");
+    auto entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry, 1);
+    check(e.availableSlots(Side::Short) == 13, "Partial entry consumes one position slot");
+    e.pause(); auto take = requireAction(e, Mutation::Create, Role::Take); ack(e, take, 1, true, 3);
+    check(e.availableSlots(Side::Short) == 14, "Closing inventory releases its slot");
 }
 void takePriorityAndSmallerSlotLimit() {
     auto e = setup(2); auto entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry, 1);
     // An old sell entry crosses the new buy take; only that entry may be cancelled.
-    e.cycles.push_back({e.nextCycle++, 0, Side::Short, p(84000), p(83000), 1, 0, true});
-    Order opposing; opposing.label = "old-short-entry"; opposing.exchangeId = "old-id"; opposing.cycle = e.cycles.back().id;
+    e.importCycle({e.nextCycle++, 0, Side::Short, p(84000), p(83000), 1, 0, true});
+    Order opposing; opposing.label = "old-short-entry"; opposing.exchangeId = "old-id"; opposing.cycle = e.cycles().back().id;
     opposing.role = Role::Entry; opposing.price = p(84000); opposing.total = 1; opposing.status = Status::Open;
-    e.orders.push_back(opposing);
+    e.importOrder(opposing);
     auto cancel = requireAction(e, Mutation::Cancel, Role::Entry);
     check(cancel.label == opposing.label, "Take must cancel the crossing bot entry first"); ack(e, cancel);
     auto take = requireAction(e, Mutation::Create, Role::Take); ack(e, take);
@@ -178,7 +285,7 @@ void manualPositionRecovery() {
     check(!e.reconcilePosition(0) && e.positionBlocked, "Manually closed position blocks stale inventory on restart");
     check(!e.nextAction(), "A missing old take must never be recreated for a manually closed position");
     const auto sequence = e.nextOrder; e.clearHistory(0);
-    check(e.cycles.empty() && e.orders.empty() && e.nextOrder == sequence && !e.positionBlocked, "Reset clears inventory without reusing order labels");
+    check(e.cycles().empty() && e.orders().empty() && e.nextOrder == sequence && !e.positionBlocked, "Reset clears inventory without reusing order labels");
     check(!e.reconcilePosition(7 * e.spec.quantityStep), "Later manual trades cannot silently alter the saved external offset");
     e.clearHistory(7 * e.spec.quantityStep);
     check(e.reconcilePosition(7 * e.spec.quantityStep) && e.trackedPosition() == 0, "Reset keeps an existing manual position outside bot cycles");
@@ -192,10 +299,10 @@ void manualPositionRecovery() {
     e.cancelAll(); cancel = requireAction(e, Mutation::Cancel, Role::Take); ack(e, cancel);
     // Reproduce the reported three old ETH long cycles after a manual flatten.
     Engine old; old.profileId = "oldeth"; old.spec = {p(0.01), p(0.0001), {}};
-    for (const double level : {2499.8, 2499.6, 2499.4}) old.cycles.push_back({old.nextCycle++, 7, Side::Long, p(level), p(level + 0.2), 40, 40, true});
+    for (const double level : {2499.8, 2499.6, 2499.4}) old.importCycle({old.nextCycle++, 7, Side::Long, p(level), p(level + 0.2), 40, 40, true});
     old.quote(p(2500.19), p(2500.39));
     check(old.trackedPosition() == p(0.012) && !old.reconcilePosition(0), "Three saved long cycles must match real ETH holdings");
-    check(!old.nextAction() && old.orders.empty(), "Startup must not send the three stale marketable takes");
+    check(!old.nextAction() && old.orders().empty(), "Startup must not send the three stale marketable takes");
     check(old.reconcilePosition(p(0.012)), "A real retained position may keep its old takes");
     take = requireAction(old, Mutation::Create, Role::Take);
     check(!take.buy && take.total == 40 && take.price == p(2500), "Legitimate old take retains its original price and quantity");
@@ -212,11 +319,11 @@ void manualTakesKeepPriority() {
     e.foreign.push_back({"late-manual-take", false, p(86000), false, true});
     auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); check(cancel.label == a.label, "Cancel the conflicting bot entry, never the manual take"); ack(e, cancel);
     e = setup(1); e.foreign.push_back({"manual-market-trigger", true, 0, true, false});
-    check(!e.nextAction() && e.orders.empty(), "An unpriced manual trigger is retained and blocks uncertain conflicts");
+    check(!e.nextAction() && e.orders().empty(), "An unpriced manual trigger is retained and blocks uncertain conflicts");
 }
 int main() {
     try {
-        pricesAndCaps(); partialAndDuplicate(); partialTakeReentry(); rebuildAndOldSlots();
+        lateFillAfterRestoringSameCycle(); malformedIdentityDoesNotMutateInventory(); lateFillAfterGridCommit(); autoRebuildProtectsRacedFills(); exactArithmeticAndSlots(); pricesAndCaps(); partialAndDuplicate(); partialTakeReentry(); rebuildAndOldSlots();
         limitsAndUncertainty(); switchingAndConflicts(); denseAndGap(); takePriorityAndSmallerSlotLimit(); simultaneousGridsSurviveFastQuotes(); manualPositionRecovery(); manualTakesKeepPriority();
         std::cout << "PASS: " << checks << " grid checks\n"; return EXIT_SUCCESS;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return EXIT_FAILURE; }

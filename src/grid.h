@@ -3,6 +3,9 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <array>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace grid {
 using Int = std::int64_t;
@@ -43,6 +46,13 @@ struct Order {
 };
 struct ForeignOrder { std::string id; bool buy = false; Int price = 0; bool conditional = false, reduceOnly = false; };
 struct Level { Int entry = 0, take = 0; Side side = Side::Short; };
+struct Preview {
+    Spec spec;
+    std::vector<Level> lattice;
+    std::vector<Int> quantities, notionals;
+    std::vector<bool> allocated;
+    std::array<int, 2> freeSlots{};
+};
 struct Action {
     Mutation kind = Mutation::None;
     std::string label, exchangeId;
@@ -62,12 +72,16 @@ public:
     Config config;
     Spec spec;
     std::string profileId;
-    std::vector<Cycle> cycles;
-    std::vector<Order> orders;
+    const std::vector<Cycle>& cycles() const { return cycles_; }
+    const std::vector<Order>& orders() const { return orders_; }
+    void restoreRecords(std::vector<Cycle> cycles, std::vector<Order> orders);
+    void importCycle(Cycle cycle);
+    void importOrder(Order order);
+    std::uint64_t revision() const { return revision_; }
     std::vector<ForeignOrder> foreign;
     std::vector<Level> lattice;
     Side active = Side::None;
-    Int generation = 0, nextCycle = 1, nextOrder = 1;
+    Int generation = 0, nextCycle = 1, nextOrder = 1, historyFloor = 1;
     Int market = 0, bid = 0, ask = 0;
     bool running = false, rebuilding = false, cancelEverything = false;
     bool blocked = false;
@@ -88,7 +102,8 @@ public:
     void uncertain(const std::string& label);
     void apply(const Update& update);
     std::optional<Action> nextAction();
-    Engine preview(const Config& next) const;
+    Preview preview(const Config& next) const;
+    Preview currentPreview() const;
     bool settled() const;
     Int trackedPosition() const;
     bool positionMatches(Int actual) const;
@@ -97,12 +112,34 @@ public:
     void clearHistory(Int actual);
     Int used(Side side) const;
     int occupiedSlots(Side side) const;
-    Cycle* cycle(Int id);
-    Order* order(const std::string& label);
+    int availableSlots(Side side) const;
+    const Cycle* cycle(Int id) const;
+    const Order* order(const std::string& label) const;
+    const Order* orderByExchangeId(const std::string& id) const;
+    bool hasLiveOrders(Int cycle) const;
     bool buys(const Order& order) const;
     Int nominal(Int lots, Int price) const;
     Int lotsFor(Int budget, Int price) const;
 private:
+    std::vector<Cycle> cycles_;
+    std::vector<Order> orders_;
+    std::unordered_map<Int, size_t> cycleIndex_;
+    std::unordered_map<std::string, size_t> labelIndex_, exchangeIndex_;
+    std::unordered_set<size_t> liveIndices_;
+    struct Totals { Int reserved = 0; int occupied = 0, positioned = 0; };
+    struct Links { std::optional<size_t> entry, take; Totals contribution; };
+    std::unordered_map<Int, Links> links_;
+    std::array<Totals, 2> totals_{};
+    std::uint64_t revision_ = 0;
+    Side movingSide_ = Side::None;
+    Int extreme_ = 0, movingAnchor_ = 0;
+    std::vector<Level> movingLevels_;
+    bool retainedLevel(const Cycle& cycle) const;
+    std::array<Int, 2> anchors_{};
+    void refreshCycle(Int id);
+    void refreshOrder(size_t index);
+    Cycle* mutableCycle(Int id);
+    Order* mutableOrder(const std::string& label);
     const Band& band(Side side) const;
     Order* liveOrder(Int cycle, Role role);
     bool eligible(bool buy, Int price) const;
