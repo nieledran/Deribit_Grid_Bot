@@ -5,6 +5,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sqlite3
+import hashlib
+import zipfile
 from datetime import datetime
 
 root = Path(__file__).resolve().parents[1]
@@ -53,19 +55,23 @@ run([cmake, "--build", build, "--config", "Release", "--parallel", "1"])
 if not args.skip_tests:
     run([Path(cmake).with_name("ctest.exe"), "--test-dir", build, "-C", "Release", "--output-on-failure"])
 if not args.core_only and not args.skip_deploy and not args.asan:
-    processes = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Process DeribitGrid -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id"], env=env, capture_output=True, text=True)
+    processes = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Process DeribitGrid* -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id"], env=env, capture_output=True, text=True)
     if processes.stdout.strip():
         raise SystemExit("Close all DeribitGrid windows before updating dist. The tested build remains in " + str(build / "Release"))
     backup = root / "build/deployment-backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
     backup.mkdir(parents=True, exist_ok=True)
     executable = root / "dist/DeribitGrid.exe"
     if executable.exists():
-        shutil.copy2(executable, backup / executable.name)
+        with zipfile.ZipFile(backup / "previous-app.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(executable, executable.name)
     for profile in (root / "dist/profiles").glob("*.db"):
         with sqlite3.connect(profile.as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(backup / profile.name) as destination:
             source.backup(destination)
     print("Previous executable and consistent profile snapshots: " + str(backup))
     run([cmake, "--install", build, "--config", "Release", "--prefix", root / "dist"])
+    built_hash = hashlib.sha256((build / "Release/DeribitGrid.exe").read_bytes()).digest()
+    if hashlib.sha256(executable.read_bytes()).digest() != built_hash:
+        raise SystemExit("Deployment verification failed: dist/DeribitGrid.exe differs from the tested build.")
     redist = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Microsoft Visual Studio/2022/Community/VC/Redist/MSVC"
     crt_paths = sorted(redist.glob("*/x64/Microsoft.VC143.CRT"), key=lambda p: tuple(int(part) for part in p.parent.parent.name.split(".")))
     if crt_paths:

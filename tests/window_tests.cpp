@@ -6,11 +6,170 @@
 #include <QMessageBox>
 #include <QtTest>
 #include <stdexcept>
+#include <algorithm>
 
 using namespace grid;
 class WindowTests : public QObject {
     Q_OBJECT
 private slots:
+    void fillsDoNotLeaveFiveSecondTakeGaps_data() {
+        QTest::addColumn<bool>("eth");
+        QTest::newRow("BTC") << false;
+        QTest::newRow("ETH") << true;
+    }
+    void fillsDoNotLeaveFiveSecondTakeGaps() {
+        QFETCH(bool, eth);
+        const QString instrument = eth ? "ETH_USDC-PERPETUAL" : "BTC_USDC-PERPETUAL";
+        const Int mid = (eth ? 2500 : 82500) * Scale, width = (eth ? 20 : 200) * Scale;
+        QTemporaryDir directory; QVERIFY(directory.isValid()); const auto path = directory.filePath("latency.db");
+        Engine seed; seed.profileId = eth ? "latencyeth" : "latencybtc"; seed.config.instrument = instrument.toStdString();
+        seed.config.longs = {mid - width, mid, 840 * Dollars, 14}; seed.config.shorts = {mid, mid + width, 500 * Dollars, 14};
+        { Store db(path); db.save(seed); }
+        QHash<QString, QJsonObject> orders; QStringList stateReads, cancelled; QList<qint64> takeLatencies;
+        int openReads = 0, tickerReads = 0; qint64 timestamp = 1; double externalChange = 0;
+        QElapsedTimer protectionClock; QWebSocket* peer = nullptr; QJsonObject delayedFill;
+        bool deliverDelayedFill = false, recovering = false;
+        const auto publish = [&](const QJsonArray& events, const QJsonArray& trades = QJsonArray{}) {
+            const QJsonObject params{{"channel", "user.changes." + instrument + ".100ms"}, {"data", QJsonObject{{"orders", events}, {"trades", trades}}}};
+            peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"method", "subscription"}, {"params", params}}).toJson()));
+        };
+        const auto trade = [&](const QJsonObject& o, double quantity) {
+            return QJsonObject{{"instrument_name", instrument}, {"order_id", o["order_id"]}, {"label", o["label"]},
+                {"trade_id", "trade-" + QString::number(++timestamp)}, {"timestamp", QDateTime::currentMSecsSinceEpoch()},
+                {"amount", quantity}, {"fee", 0.0}, {"fee_currency", "USDC"}};
+        };
+        const auto saved = [&] { Store db(path); Engine e; db.load(e); return e; };
+        const auto settleAccountRead = [&] {
+            QTest::qWait(50);
+            const int before = tickerReads;
+            publish({}, QJsonArray{QJsonObject{{"instrument_name", instrument}, {"order_id", "read-barrier"}}});
+            if (!QTest::qWaitFor([&] { return tickerReads > before; }, 6000)) return false;
+            QTest::qWait(50); return true;
+        };
+        const auto takeFor = [&](const QString& entryId) {
+            const auto label = orders.value(entryId)["label"].toString(); const auto prefix = label.left(label.indexOf("_e_")) + "_t_";
+            for (auto i = orders.cbegin(); i != orders.cend(); ++i) if (i.value()["label"].toString().startsWith(prefix) && i.value()["order_state"] == "open") return i.key();
+            return QString{};
+        };
+        QWebSocketServer server("Fill latency", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString(); const auto p = j["params"].toObject();
+                if (recovering) qInfo() << instrument << "recovery ms:" << protectionClock.elapsed() << method;
+                QJsonValue result = QJsonObject{{"ok", true}};
+                if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 123454321}};
+                else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", instrument}, {"base_currency", eth ? "ETH" : "BTC"},
+                    {"settlement_currency", "USDC"}, {"kind", "future"}, {"settlement_period", "perpetual"}, {"state", "open"},
+                    {"tick_size", eth ? 0.01 : 0.1}, {"min_trade_amount", 0.0001}, {"contract_size", 0.0001}};
+                else if (method == "public/ticker") {
+                    ++tickerReads; result = QJsonObject{{"instrument_name", instrument},
+                        {"best_bid_price", double(mid) / Scale - 0.01}, {"best_ask_price", double(mid) / Scale + 0.01}};
+                }
+                else if (method == "private/get_position") {
+                    double actual = externalChange;
+                    for (const auto& o : orders) actual += (o["direction"] == "buy" ? 1 : -1) * o["filled_amount"].toDouble();
+                    result = QJsonObject{{"size_currency", actual}};
+                    if (deliverDelayedFill) {
+                        deliverDelayedFill = false;
+                        QTimer::singleShot(100, &server, [&] { publish(QJsonArray{delayedFill, delayedFill}); });
+                    }
+                } else if (method == "private/get_open_orders_by_instrument") {
+                    ++openReads; QJsonArray open;
+                    for (const auto& o : orders) if (o["order_state"] == "open") open.append(o);
+                    result = open;
+                } else if (method == "private/get_order_state") {
+                    const auto id = p["order_id"].toString(); stateReads.append(id); result = orders.value(id);
+                } else if (method == "private/get_user_trades_by_order") result = QJsonArray{};
+                else if (method == "private/buy" || method == "private/sell") {
+                    const auto id = "sim-" + p["label"].toString();
+                    const QJsonObject o{{"instrument_name", instrument}, {"order_id", id}, {"label", p["label"]}, {"order_type", "limit"},
+                        {"order_state", "open"}, {"direction", method == "private/buy" ? "buy" : "sell"}, {"price", p["price"]},
+                        {"amount", p["amount"]}, {"filled_amount", 0.0}, {"last_update_timestamp", ++timestamp}};
+                    orders.insert(id, o); result = QJsonObject{{"order", o}};
+                    if (p["label"].toString().contains("_t_") && protectionClock.isValid()) takeLatencies.append(protectionClock.elapsed());
+                } else if (method == "private/edit" || method == "private/cancel") {
+                    const auto id = p["order_id"].toString(); auto o = orders.value(id);
+                    if (method == "private/edit") o["amount"] = p["amount"];
+                    else { cancelled.append(id); o["order_state"] = "cancelled"; }
+                    o["last_update_timestamp"] = ++timestamp; orders[id] = o; result = o;
+                }
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", j["id"]}, {"result", result}}).toJson()));
+            });
+        });
+        Window window(path, instrument, nullptr, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake");
+        window.findChild<QPushButton*>("connect")->click();
+        QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text(), QString("Connected"), 5000);
+        QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled()); window.findChild<QPushButton*>("start")->click();
+        QTRY_COMPARE_WITH_TIMEOUT(orders.size(), 28, 18000);
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 1000);
+        QStringList shorts;
+        for (auto i = orders.cbegin(); i != orders.cend(); ++i) if (i.value()["direction"] == "sell") shorts.append(i.key());
+        std::sort(shorts.begin(), shorts.end(), [&](const QString& a, const QString& b) { return orders[a]["price"].toDouble() < orders[b]["price"].toDouble(); });
+        QCOMPARE(shorts.size(), 14); QCOMPARE(saved().availableSlots(Side::Short), 14);
+        QVERIFY(settleAccountRead());
+
+        // The REST position overtakes a batched order update; duplicate updates must not double inventory.
+        const int readsBeforeDelay = openReads;
+        auto& first = orders[shorts[0]]; first["filled_amount"] = 0.0002; first["last_update_timestamp"] = ++timestamp;
+        delayedFill = first; deliverDelayedFill = true; protectionClock.start();
+        publish({}, QJsonArray{trade(first, 0.0002)});
+        QTRY_VERIFY_WITH_TIMEOUT(!takeFor(shorts[0]).isEmpty(), 1000);
+        QVERIFY(!takeLatencies.isEmpty()); QVERIFY(takeLatencies.back() <= 1000);
+        const auto ordinaryLatency = takeLatencies.back();
+        QTRY_COMPARE_WITH_TIMEOUT(saved().availableSlots(Side::Short), 13, 1000);
+        QCOMPARE(saved().trackedPosition(), Int(-20000)); QCOMPARE(openReads, readsBeforeDelay); QVERIFY(cancelled.isEmpty()); QVERIFY(stateReads.isEmpty());
+
+        // Partial and final take fills release inventory once, even with duplicates and a stale snapshot.
+        const auto firstTakeId = takeFor(shorts[0]); auto& firstTake = orders[firstTakeId];
+        firstTake["filled_amount"] = 0.0001; firstTake["last_update_timestamp"] = ++timestamp; const auto partialTake = firstTake;
+        publish(QJsonArray{firstTake, firstTake}, QJsonArray{trade(firstTake, 0.0001)});
+        QTRY_COMPARE_WITH_TIMEOUT(saved().trackedPosition(), Int(-10000), 1000); QCOMPARE(saved().availableSlots(Side::Short), 13);
+        firstTake["filled_amount"] = 0.0002; firstTake["order_state"] = "filled"; firstTake["last_update_timestamp"] = ++timestamp;
+        publish(QJsonArray{firstTake, firstTake, partialTake}, QJsonArray{trade(firstTake, 0.0001)});
+        QTRY_COMPARE_WITH_TIMEOUT(saved().availableSlots(Side::Short), 14, 1000);
+        // Wait for the repeat entry to be fully replenished, not just for a gap between two edits.
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            const auto e = saved(); const auto* o = e.order(orders.value(shorts[0])["label"].toString().toStdString());
+            return o && o->mutation == Mutation::None && o->remaining() == e.cycle(o->cycle)->capacity;
+        })(), 1500);
+        QVERIFY(settleAccountRead());
+
+        // Lose two terminal entry notifications. Only those absent from the bulk snapshot need individual reads.
+        const int readsBeforeLoss = openReads; stateReads.clear(); takeLatencies.clear(); QJsonArray lostTrades;
+        const QStringList lostEntries{shorts[0], shorts[1]};
+        Int lostLots = 0;
+        for (const auto& id : lostEntries) {
+            auto& o = orders[id]; const double delta = o["amount"].toDouble() - o["filled_amount"].toDouble();
+            o["filled_amount"] = o["amount"]; o["order_state"] = "filled"; o["last_update_timestamp"] = ++timestamp;
+            lostLots += Int(std::llround(delta * 10000)); lostTrades.append(trade(o, delta));
+        }
+        protectionClock.restart(); recovering = true; publish({}, lostTrades);
+        QTRY_VERIFY_WITH_TIMEOUT(!takeFor(lostEntries[0]).isEmpty() && !takeFor(lostEntries[1]).isEmpty(), 1500);
+        QCOMPARE(takeLatencies.size(), 2); QVERIFY(takeLatencies.back() <= 1500);
+        recovering = false;
+        QCOMPARE(openReads, readsBeforeLoss + 1); QCOMPARE(stateReads.size(), 2);
+        QVERIFY(stateReads.contains(lostEntries[0])); QVERIFY(stateReads.contains(lostEntries[1])); QVERIFY(cancelled.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(saved().trackedPosition(), -lostLots * (Scale / 10000), 1000);
+        QCOMPARE(saved().availableSlots(Side::Short), 12); QVERIFY(saved().running); QVERIFY(!saved().positionBlocked);
+        QVERIFY(window.findChild<QPlainTextEdit*>()->toPlainText().contains("account position. Running."));
+
+        // A real external change still blocks entries and keeps the accepted takes intact.
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 1000);
+        QVERIFY(settleAccountRead());
+        externalChange = 0.0001;
+        publish({}, QJsonArray{QJsonObject{{"instrument_name", instrument}, {"order_id", "manual"}, {"amount", 0.0001}}});
+        QTRY_VERIFY_WITH_TIMEOUT(saved().positionBlocked, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!cancelled.isEmpty(), 1500);
+        for (const auto& id : cancelled) QVERIFY(!orders[id]["label"].toString().contains("_t_"));
+        QCOMPARE(*saved().externalPosition, Int(0)); QVERIFY(!saved().running);
+        const auto journal = window.findChild<QPlainTextEdit*>()->toPlainText();
+        QVERIFY(journal.contains("external=0.00000000 coin")); QVERIFY(journal.contains("difference=0.00010000 coin"));
+        qInfo() << instrument << "delayed-fill take ms:" << ordinaryLatency << "recovered takes ms:" << takeLatencies
+                << "individual recovery reads:" << stateReads.size();
+    }
     void manualAndExistingBotTakesSurviveRestart_data() {
         QTest::addColumn<bool>("trigger");
         QTest::newRow("manual-limit") << false;
@@ -120,14 +279,18 @@ private slots:
     void pauseProtectsAFillRacingCancellation_data() {
         QTest::addColumn<bool>("recover");
         QTest::addColumn<bool>("isLong");
-        QTest::newRow("live-partial-short") << false << false;
-        QTest::newRow("accepted-short-with-lost-reply") << true << false;
-        QTest::newRow("live-partial-long") << false << true;
-        QTest::newRow("accepted-long-with-lost-reply") << true << true;
+        QTest::addColumn<bool>("resetStats");
+        QTest::newRow("live-partial-short") << false << false << false;
+        QTest::newRow("accepted-short-with-lost-reply") << true << false << false;
+        QTest::newRow("live-partial-long") << false << true << false;
+        QTest::newRow("accepted-long-with-lost-reply") << true << true << false;
+        QTest::newRow("reset-partial-short") << false << false << true;
+        QTest::newRow("reset-recovered-long") << true << true << true;
     }
     void pauseProtectsAFillRacingCancellation() {
         QFETCH(bool, recover);
         QFETCH(bool, isLong);
+        QFETCH(bool, resetStats);
         QTemporaryDir directory; QVERIFY(directory.isValid()); const auto path = directory.filePath("profile.db");
         Engine seed; seed.profileId = "windowtest";
         if (isLong) seed.config.longs = {80000 * Scale, 84500 * Scale, 850 * Dollars, 1};
@@ -219,18 +382,28 @@ private slots:
         const QString partialPnl = isLong ? "0.4500" : "0.5400";
         const QString partialCost = recover ? "0.0020" : "0.0120";
         QTRY_COMPARE(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC\nClosed trades: 0").arg(partialPnl, partialCost));
+        const QString zeroStats = "Approx. P&L: 0.0000 USDC\nFees (entry + take): 0.0000 USDC\nClosed trades: 0";
+        if (resetStats) {
+            Engine before; { Store db(path); QVERIFY(db.load(before)); }
+            auto* reset = window.findChild<QPushButton*>("resetStats"); QVERIFY(reset); reset->click();
+            QCOMPARE(stats->text(), zeroStats);
+            Engine after; { Store db(path); QVERIFY(db.load(after)); }
+            QCOMPARE(encodeEngine(after), encodeEngine(before));
+            publish(partial, duplicateFees); publish(partial, takeFees);
+            QTest::qWait(100); QCOMPARE(stats->text(), zeroStats);
+        }
         take["filled_amount"] = 0.0004; take["last_update_timestamp"] = 5; take["order_state"] = "filled";
         auto finalTrade = trade("take-1", "take-b", 0.0003, 0.006);
         auto missingFee = finalTrade; missingFee.remove("fee"); takeFees.append(missingFee);
         publish(take, takeFees); publish(take, takeFees); publish(partial);
-        const QString fullPnl = isLong ? "1.8000" : "2.1600";
-        QTRY_COMPARE(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC (incomplete)\nClosed trades: 1").arg(fullPnl, partialCost));
+        const QString fullPnl = resetStats ? (isLong ? "1.3500" : "1.6200") : (isLong ? "1.8000" : "2.1600");
+        QTRY_COMPARE(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC (incomplete)\nClosed trades: 1").arg(fullPnl, resetStats ? "0.0000" : partialCost));
         auto wrongCurrency = finalTrade; wrongCurrency["fee_currency"] = "BTC"; publish({}, QJsonArray{wrongCurrency});
         QTest::qWait(350); QVERIFY(stats->text().contains("(incomplete)"));
         // A reconnect obtains the missed fee once, including for an already closed order.
         takeFees.replace(1, finalTrade);
         window.findChild<QPushButton*>("connect")->click();
-        const QString fullCost = recover ? "0.0080" : "0.0180";
+        const QString fullCost = resetStats ? "0.0060" : (recover ? "0.0080" : "0.0180");
         QTRY_COMPARE_WITH_TIMEOUT(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC\nClosed trades: 1").arg(fullPnl, fullCost), 5000);
         publish({}, takeFees); publish(partial, entryFees);
         QTest::qWait(100);
@@ -246,6 +419,10 @@ private slots:
         QVERIFY(restored.externalPosition.has_value()); QCOMPARE(*restored.externalPosition, recover ? Int(0) : Int(-40000));
         QVERIFY(restored.nextOrder >= nextOrder); QVERIFY(!restored.running);
         QCOMPARE(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC\nClosed trades: 1").arg(fullPnl, fullCost));
+        window.findChild<QPushButton*>("resetStats")->click();
+        QCOMPARE(stats->text(), zeroStats);
+        publish(take, takeFees); publish(take, entryFees);
+        QTest::qWait(350); QCOMPARE(stats->text(), zeroStats);
         window.close();
         // Session counters are deliberately absent from the saved state.
         { Store db(path); QVERIFY(db.load(restored)); }

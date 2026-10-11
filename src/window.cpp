@@ -30,6 +30,14 @@ double accountPosition(const QJsonObject& position) {
     if (!value.isDouble() || !std::isfinite(value.toDouble())) throw std::runtime_error("Missing account position in base currency");
     return value.toDouble();
 }
+QString positionDetails(const Engine& engine, Int actual) {
+    const Int tracked = engine.trackedPosition();
+    const Int external = engine.externalPosition.value_or(tracked == 0 ? actual : 0);
+    const double expected = price(tracked) + price(external);
+    return QString("actual=%1 coin; bot=%2 coin; external=%3 coin; expected=%4 coin; difference=%5 coin")
+        .arg(price(actual), 0, 'f', 8).arg(price(tracked), 0, 'f', 8).arg(price(external), 0, 'f', 8)
+        .arg(expected, 0, 'f', 8).arg(price(actual) - expected, 0, 'f', 8);
+}
 QString amount(Int lots, const Spec& s) { return QString::number(static_cast<double>(lots) * s.quantityStep / Scale, 'f', 8); }
 QString money(Int value) { return QString::number(static_cast<double>(value) / Dollars, 'f', 2); }
 QString role(Role r) { return r == Role::Entry ? "Entry" : "Take"; }
@@ -91,12 +99,15 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     startButton->setObjectName("start"); pauseButton->setObjectName("pause");
     applyButton = new QPushButton("Apply settings / Rebuild"); cancelButton = new QPushButton("Cancel all bot orders");
     previewBox = new QCheckBox("Preview pending settings");
-    buttons->addWidget(startButton); buttons->addWidget(pauseButton); buttons->addWidget(applyButton); buttons->addWidget(cancelButton); buttons->addWidget(previewBox); buttons->addStretch(); layout->addLayout(buttons);
+    auto* resetStatsButton = new QPushButton("Reset stats"); resetStatsButton->setObjectName("resetStats");
+    resetStatsButton->setToolTip("Start a new count of P&L, fees and closed trades. Trading, orders and positions continue unchanged.");
+    connect(resetStatsButton, &QPushButton::clicked, this, &Window::resetStats);
+    buttons->addWidget(startButton); buttons->addWidget(pauseButton); buttons->addWidget(applyButton); buttons->addWidget(cancelButton); buttons->addWidget(previewBox); buttons->addStretch(); buttons->addWidget(resetStatsButton); layout->addLayout(buttons);
     auto* statusRow = new QHBoxLayout;
     summaryLabel = new QLabel; summaryLabel->setWordWrap(true); statusRow->addWidget(summaryLabel, 1);
     statsLabel = new QLabel; statsLabel->setObjectName("sessionStats");
     statsLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    statsLabel->setToolTip("P&L is gross, using grid entry/take prices, excluding fees and funding. Fees are actual USDC fees for both entries and takes since the first connection; negative fees are rebates. Incomplete means some fees are unavailable. Each fully executed take order counts once. Counters reset when this window closes.");
+    statsLabel->setToolTip("P&L is gross, using grid entry/take prices, excluding fees and funding. Fees are actual USDC fees for both entries and takes since the first connection or last stats reset; negative fees are rebates. Incomplete means some fees are unavailable. Each fully executed take order counts once. Counters reset when this window closes or Reset stats is clicked.");
     statusRow->addWidget(statsLabel); layout->addLayout(statusRow);
     auto* tabs = new QTabWidget;
     cyclesTable = new QTableWidget; setupTable(cyclesTable, {"Cycle", "Side", "Generation", "Entry", "Take", "Capacity (coin)", "Open (coin)", "Reserved USDC", "Mode"});
@@ -245,7 +256,7 @@ void Window::initialize(const QJsonObject&) {
     });
 }
 void Window::synchronize() {
-    syncing = true; ready = false; positionChecks = 0; reconcileLabels.clear(); reconcileIndex = 0;
+    syncing = true; ready = false; positionChecks = 0; reconcileLabels.clear(); reconcileIndex = 0; reconcileSnapshots.clear();
     for (const auto& o : engine.orders()) if (o.live() || o.mutation != Mutation::None) reconcileLabels.push_back(o.label);
     // Classify once; preserve notification order within each role.
     std::stable_partition(reconcileLabels.begin(), reconcileLabels.end(), [this](const auto& label) {
@@ -255,18 +266,35 @@ void Window::synchronize() {
     client.call("private/get_open_orders_by_instrument", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch](const RpcResult& r) {
         if (epoch != session) return;
         if (!r.ok) { fail(r.error); return; }
-        engine.foreign.clear();
-        for (const auto& v : r.value.toArray()) {
-            const auto o = v.toObject();
-            if (!engine.order(o["label"].toString().toStdString())) {
-                if (o["label"].toString().startsWith("dg_" + text(engine.profileId) + "_")) { fail("Untracked order with this profile label; manual review required"); return; }
-                receiveForeignOrder(o);
+        try {
+            if (!r.value.isArray()) throw std::runtime_error("Invalid open order list during reconciliation");
+            engine.foreign.clear();
+            for (const auto& v : r.value.toArray()) {
+                const auto o = v.toObject(); const auto label = o["label"].toString();
+                if (engine.order(label.toStdString())) {
+                    if (reconcileSnapshots.contains(label)) throw std::runtime_error("Duplicate bot label in open order list");
+                    reconcileSnapshots.insert(label, o);
+                } else {
+                    if (label.startsWith("dg_" + text(engine.profileId) + "_")) throw std::runtime_error("Untracked order with this profile label; manual review required");
+                    receiveForeignOrder(o);
+                }
             }
-        }
-        reconcileNext();
+            reconcileNext();
+        } catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); }
     });
 }
 void Window::reconcileNext() {
+    // Reuse the bulk snapshot in entry-before-take order. Uncertain requests still need an explicit read.
+    try {
+        while (reconcileIndex < reconcileLabels.size()) {
+            const auto& label = reconcileLabels[reconcileIndex]; const auto* o = engine.order(label);
+            if (!o) throw std::runtime_error("Missing order during reconciliation");
+            const auto snapshot = reconcileSnapshots.find(text(label));
+            if (snapshot == reconcileSnapshots.end() || o->exchangeId.empty() || o->mutation != Mutation::None || o->status == Status::Uncertain) break;
+            // No request is pending for these snapshots; completeSync commits the batch before trading.
+            receiveOrder(snapshot.value(), false, false); ++reconcileIndex;
+        }
+    } catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); return; }
     if (reconcileIndex >= reconcileLabels.size()) { completeSync(); return; }
     const auto label = reconcileLabels[reconcileIndex++]; const auto* o = engine.order(label); const int epoch = session;
     if (!o) { syncing = false; fail("Missing order during reconciliation"); return; }
@@ -282,7 +310,7 @@ void Window::reconcileNext() {
         if (!r.ok || snapshot["order_id"].toString().isEmpty() || snapshot["label"].toString() != text(label)) {
             engine.uncertain(label); save(); fail("Cannot resolve saved order " + text(label) + ": " + r.error); syncing = false; return;
         }
-        try { receiveOrder(snapshot, true); QTimer::singleShot(100, this, [this, epoch] { if (epoch == session) reconcileNext(); }); }
+        try { receiveOrder(snapshot, true); reconcileNext(); }
         catch (const std::exception& ex) { fail(QString::fromUtf8(ex.what())); syncing = false; }
     });
 }
@@ -302,10 +330,13 @@ void Window::completeSync() {
                     netPosition = accountPosition(r.value.toObject()); const Int actual = signedFixed(netPosition);
                     if (!engine.positionMatches(actual) && positionChecks++ < 2) { QTimer::singleShot(250, this, [this, epoch] { if (epoch == session) completeSync(); }); return; }
                     const bool matched = engine.reconcilePosition(actual);
+                    if (!matched) log("Position mismatch: " + positionDetails(engine, actual));
                     if (!statsReady) feesSince = QDateTime::currentMSecsSinceEpoch();
                     syncing = false; ready = true; statsReady = true; save();
-                    log(matched ? "Reconciled own orders and account position. Start / Resume rebuilds free slots." : text(engine.problem));
+                    log(matched ? QString("Reconciled own orders and account position. %1.").arg(engine.running ? "Running" : "Paused; Start / Resume rebuilds free slots") : text(engine.problem));
                     receiveTrades(bufferedTrades); bufferedTrades = {};
+                    // Protect recovered fills before queuing fee/account reads or waiting for the next pump tick.
+                    if (matched) pump();
                     try { for (const auto& id : store->missingFees()) refreshFees(id); } catch (const std::exception&) { feesUnavailable = true; }
                     refreshAccount(); render();
                 } catch (const std::exception& e) { syncing = false; fail(QString::fromUtf8(e.what())); }
@@ -371,9 +402,9 @@ void Window::receiveTrades(const QJsonArray& trades) {
 void Window::refreshFees(const QString& id) {
     try {
     if (feesUnavailable || !ready || syncing || !client.authenticated() || feeRequests.contains(id) || store->feeValue(id, true) >= store->feeValue(id)) return;
-    feeRequests.insert(id); const int epoch = session; const Int expected = store->feeValue(id);
-    client.call("private/get_user_trades_by_order", {{"order_id", id}, {"sorting", "asc"}}, [this, id, epoch, expected](const RpcResult& r) {
-        if (epoch != session) return;
+    feeRequests.insert(id); const int epoch = session; const Int expected = store->feeValue(id); const auto statsEpoch = statsRevision;
+    client.call("private/get_user_trades_by_order", {{"order_id", id}, {"sorting", "asc"}}, [this, id, epoch, expected, statsEpoch](const RpcResult& r) {
+        if (epoch != session || statsEpoch != statsRevision) return;
         try {
         feeRequests.remove(id);
         if (r.ok && r.value.isArray()) receiveTrades(r.value.toArray());
@@ -398,18 +429,28 @@ void Window::refreshAccount() {
     client.call("private/get_position", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch, revision](const RpcResult& r) {
         if (epoch != session) return;
         try {
+            Int actual = 0;
             if (r.ok) {
                 netPosition = accountPosition(r.value.toObject());
-                if (ready && !syncing && !busy && !engine.positionBlocked && revision == positionRevision && !engine.positionMatches(signedFixed(netPosition))) {
-                    readBusy = false; log("Account position changed outside tracked fills; reconciling before further requests"); synchronize(); return;
-                }
+                actual = signedFixed(netPosition);
             } else log(r.error);
+            const auto finish = [this, epoch, revision, actual, ok = r.ok] {
+                if (epoch != session) return;
+                try {
+                    if (ok && ready && !syncing && !busy && !engine.positionBlocked && revision == positionRevision && !engine.positionMatches(actual)) {
+                        readBusy = false; log("Account position differs from tracked fills; reconciling: " + positionDetails(engine, actual)); synchronize(); return;
+                    }
+                    client.call("public/ticker", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch](const RpcResult& t) {
+                        if (epoch != session) return; readBusy = false;
+                        try { if (t.ok) readMarket(t.value.toObject()); else log(t.error); render(); }
+                        catch (const std::exception& e) { fail(QString::fromUtf8(e.what())); }
+                    });
+                } catch (const std::exception& e) { readBusy = false; log(QString::fromUtf8(e.what())); }
+            };
+            // Account reads can overtake the aggregated fill notification; do not freeze takes on that first snapshot.
+            if (r.ok && revision == positionRevision && !engine.positionMatches(actual)) QTimer::singleShot(200, this, finish);
+            else finish();
         } catch (const std::exception& e) { readBusy = false; log(QString::fromUtf8(e.what())); return; }
-        client.call("public/ticker", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch](const RpcResult& t) {
-            if (epoch != session) return; readBusy = false;
-            try { if (t.ok) readMarket(t.value.toObject()); else log(t.error); render(); }
-            catch (const std::exception& e) { fail(QString::fromUtf8(e.what())); }
-        });
     });
 }
 void Window::startGrid() {
@@ -442,6 +483,14 @@ void Window::resetHistory() {
         });
     });
 }
+void Window::resetStats() {
+    try {
+        store->resetFees();
+        ++statsRevision; feesSince = QDateTime::currentMSecsSinceEpoch(); feeRequests.clear();
+        sessionPnl = 0; sessionFees = 0; closedTrades = 0; feesUnavailable = false;
+        log("P&L, fees and closed trades reset. New statistics period started."); render();
+    } catch (const std::exception& e) { log("Cannot reset statistics: " + QString::fromUtf8(e.what())); }
+}
 void Window::submit(const Action& a) {
     save(); if (storageFailed) return; busy = true;
     const QString method = a.kind == Mutation::Create ? (a.buy ? "private/buy" : "private/sell") : a.kind == Mutation::Edit ? "private/edit" : "private/cancel";
@@ -459,6 +508,7 @@ void Window::submit(const Action& a) {
             } else {
                 const auto root = r.value.toObject(); const auto order = root.contains("order") ? root["order"].toObject() : root;
                 receiveOrder(order, true); receiveTrades(root["trades"].toArray()); save();
+                if (a.role == Role::Take) QTimer::singleShot(0, this, &Window::pump);
             }
             render();
         } catch (const std::exception& e) { engine.uncertain(a.label); save(); log(QString::fromUtf8(e.what())); ready = false; synchronize(); }

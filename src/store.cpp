@@ -248,6 +248,10 @@ QStringList Store::missingFees() {
     QSqlQuery q(db); sqlCheck(q.exec("SELECT id FROM fees WHERE expected > covered"), q);
     QStringList ids; while (q.next()) ids.append(q.value(0).toString()); return ids;
 }
+void Store::resetFees() {
+    // Keep trade IDs so a duplicate received at the reset boundary cannot add an old fee again.
+    QSqlQuery q(db); sqlCheck(q.exec("DELETE FROM fees"), q);
+}
 bool Store::feesComplete() {
     QSqlQuery q(db); sqlCheck(q.exec("SELECT 1 FROM fees WHERE expected > covered LIMIT 1"), q); return !q.next();
 }

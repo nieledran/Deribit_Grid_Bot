@@ -19,6 +19,7 @@ public:
     void expectFee(const QString& id, grid::Int lots);
     grid::Int feeValue(const QString& id, bool covered = false);
     bool recordFee(const QString& key, const QString& id, grid::Int lots);
+    void resetFees();
     QStringList missingFees();
     bool feesComplete();
     void bindAccount(const QString& identity);

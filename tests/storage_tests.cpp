@@ -65,6 +65,11 @@ private slots:
         QVERIFY(store.feesComplete()); store.expectFee("exchange-1", 1); QVERIFY(!store.feesComplete());
         QVERIFY(store.recordFee("exchange-1/trade-1", "exchange-1", 1));
         QVERIFY(!store.recordFee("exchange-1/trade-1", "exchange-1", 1)); QVERIFY(store.feesComplete());
+        store.expectFee("exchange-1", 2); QVERIFY(!store.feesComplete());
+        store.resetFees(); QVERIFY(store.feesComplete()); QVERIFY(store.missingFees().isEmpty());
+        QVERIFY(!store.recordFee("exchange-1/trade-1", "exchange-1", 1));
+        store.expectFee("exchange-1", 1);
+        QVERIFY(store.recordFee("exchange-1/trade-2", "exchange-1", 1)); QVERIFY(store.feesComplete());
         // Fee deduplication belongs only to this Store session.
         { Store another(path); QVERIFY(another.recordFee("exchange-1/trade-1", "exchange-1", 1)); }
     }

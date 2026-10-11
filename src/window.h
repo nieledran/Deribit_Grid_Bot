@@ -49,11 +49,13 @@ private:
     bool statsReady = false, feesUnavailable = false;
     double sessionFees = 0;
     qint64 feesSince = 0;
+    quint64 statsRevision = 0;
     QSet<QString> feeRequests;
     QString accountId;
     QUrl testEndpoint;
     std::vector<std::string> reconcileLabels;
     size_t reconcileIndex = 0;
+    QHash<QString, QJsonObject> reconcileSnapshots;
     QJsonArray bufferedOrders;
     QJsonArray bufferedTrades;
     grid::Config uiConfig() const;
@@ -78,5 +80,6 @@ private:
     void readMarket(const QJsonObject& ticker);
     void refreshAccount();
     void startGrid();
+    void resetStats();
     void resetHistory();
 };
