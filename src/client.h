@@ -25,6 +25,7 @@ public:
     void stop();
     qint64 call(const QString& method, const QJsonObject& params, Callback callback, bool mutation = false);
     bool authenticated() const { return authorized; }
+    void setTradingLimits(const QJsonObject& limits);
 signals:
     void authenticatedSession(const QJsonObject& auth);
     void lost();
@@ -39,7 +40,8 @@ private:
     std::deque<std::pair<qint64, QJsonObject>> outbound;
     QString clientId, clientSecret, refreshToken;
     QUrl endpoint;
-    qint64 sequence = 0, lastMessage = 0, lastSent = -100;
+    qint64 sequence = 0, lastMessage = 0, lastSent = -100, lastMutation = -250;
+    int mutationInterval = 250;
     int retryMs = 1500;
     bool wanted = false, authorized = false;
     void authenticate(bool renew);

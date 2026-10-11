@@ -37,9 +37,10 @@ private:
     QPlainTextEdit* journal = nullptr;
     QLabel *connectionLabel = nullptr, *summaryLabel = nullptr, *statsLabel = nullptr;
     QCheckBox* previewBox = nullptr;
-    QPushButton *connectButton = nullptr, *startButton = nullptr, *pauseButton = nullptr, *applyButton = nullptr, *cancelButton = nullptr, *resetButton = nullptr;
+    QPushButton *connectButton = nullptr, *startButton = nullptr, *pauseButton = nullptr, *applyButton = nullptr, *cancelButton = nullptr, *resetButton = nullptr, *deleteProfileButton = nullptr;
     bool ready = false, syncing = false, busy = false, closing = false, closeAllowed = false;
     bool readBusy = false, storageFailed = false;
+    bool recoveryCancelling = false;
     int session = 0;
     int positionChecks = 0;
     quint64 positionRevision = 0;
@@ -52,10 +53,12 @@ private:
     quint64 statsRevision = 0;
     QSet<QString> feeRequests;
     QString accountId;
+    QString profilePath;
     QUrl testEndpoint;
     std::vector<std::string> reconcileLabels;
     size_t reconcileIndex = 0;
     QHash<QString, QJsonObject> reconcileSnapshots;
+    std::vector<std::string> absentCreates;
     QJsonArray bufferedOrders;
     QJsonArray bufferedTrades;
     grid::Config uiConfig() const;
@@ -71,6 +74,11 @@ private:
     void initialize(const QJsonObject& auth);
     void synchronize();
     void reconcileNext();
+    void reconcileHistory(const std::string& label, bool historical, int offset, int pass);
+    void confirmMissingCreate(const std::string& label);
+    void cancelProfileOrders(bool eraseProfile);
+    void cancelProfileLabels(const QStringList& labels, int index, bool eraseProfile);
+    void verifyProfileCancellation(bool eraseProfile, int checks);
     void completeSync();
     void receiveOrder(const QJsonObject& order, bool resolve = false, bool persist = true, const std::string* label = nullptr);
     void receiveOrders(const QJsonArray& orders);

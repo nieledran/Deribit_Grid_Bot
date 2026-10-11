@@ -57,6 +57,7 @@ void setupTable(QTableWidget* table, const QStringList& headers) {
 }
 }
 Window::Window(const QString& profile, const QString& initialInstrument, QWidget* parent, const QUrl& endpoint, bool initialProduction) : QMainWindow(parent), client(this), testEndpoint(endpoint) {
+    profilePath = QFileInfo(profile).absoluteFilePath();
     QDir().mkpath(QFileInfo(profile).absolutePath());
     profileLock = std::make_unique<QLockFile>(profile + ".lock");
     if (!profileLock->tryLock()) throw std::runtime_error("This profile is already open in another instance");
@@ -98,6 +99,7 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     startButton = new QPushButton("Start / Resume"); pauseButton = new QPushButton("Pause (keep takes)");
     startButton->setObjectName("start"); pauseButton->setObjectName("pause");
     applyButton = new QPushButton("Apply settings / Rebuild"); cancelButton = new QPushButton("Cancel all bot orders");
+    cancelButton->setObjectName("cancelBotOrders");
     previewBox = new QCheckBox("Preview pending settings");
     auto* resetStatsButton = new QPushButton("Reset stats"); resetStatsButton->setObjectName("resetStats");
     resetStatsButton->setToolTip("Start a new count of P&L, fees and closed trades. Trading, orders and positions continue unchanged.");
@@ -120,6 +122,13 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     resetButton->setToolTip("Cancel all bot orders first. Clears saved cycles/orders and tracked inventory, keeping settings and session counters. Exchange position stays open.");
     historyButtons->addWidget(clearLogButton); historyButtons->addWidget(resetButton); historyButtons->addStretch(); layout->addLayout(historyButtons);
     journal = new QPlainTextEdit; journal->setReadOnly(true); journal->setMaximumBlockCount(1000); journal->setMaximumHeight(155); layout->addWidget(journal);
+    auto* footer = new QHBoxLayout; footer->addStretch();
+    deleteProfileButton = new QPushButton("Delete current profile"); deleteProfileButton->setObjectName("deleteProfile");
+    auto deletePalette = deleteProfileButton->palette(); deletePalette.setColor(QPalette::ButtonText, QColor("#b91c1c"));
+    deletePalette.setColor(QPalette::Button, QColor("#fee2e2")); deleteProfileButton->setPalette(deletePalette);
+    deleteProfileButton->setToolTip("Cancel this profile's exchange orders, then clear only its saved settings and history. Exchange positions remain open.");
+    footer->addWidget(deleteProfileButton); layout->addLayout(footer);
+    connect(deleteProfileButton, &QPushButton::clicked, this, [this] { cancelProfileOrders(true); });
     connect(clearLogButton, &QPushButton::clicked, journal, &QPlainTextEdit::clear);
     connect(resetButton, &QPushButton::clicked, this, &Window::resetHistory);
     connect(connectButton, &QPushButton::clicked, this, &Window::connectExchange);
@@ -127,12 +136,13 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     connect(applyButton, &QPushButton::clicked, this, &Window::startGrid);
     connect(pauseButton, &QPushButton::clicked, this, [this] { engine.pause(); save(); log("Pausing: cancelling entries and protecting fills"); render(); });
     connect(cancelButton, &QPushButton::clicked, this, [this] {
+        if (!ready) { cancelProfileOrders(false); return; }
         if (QMessageBox::question(this, "Cancel bot orders", "Cancel every entry and take of this profile? The position will remain open.") != QMessageBox::Yes) return;
         engine.cancelAll(); save(); log("Cancelling all bot orders; position stays open"); render();
     });
     connect(&client, &Client::notice, this, &Window::log);
     connect(&client, &Client::lost, this, [this] {
-        ++session; ready = false; syncing = false; busy = false; readBusy = false; feeRequests.clear(); engine.disconnected(); save();
+        ++session; ready = false; syncing = false; busy = false; recoveryCancelling = false; readBusy = false; feeRequests.clear(); engine.disconnected(); save();
         log("Disconnected: exchange orders remain; waiting for reconciliation"); render();
     });
     connect(&client, &Client::authenticatedSession, this, &Window::initialize);
@@ -231,6 +241,7 @@ void Window::initialize(const QJsonObject&) {
                 if (!a.ok) { fail(a.error); return; }
                 try {
                     const auto o = a.value.toObject(); const auto id = o["id"];
+                    client.setTradingLimits(o["limits"].toObject());
                     if ((!id.isString() && !id.isDouble()) || (id.isString() && id.toString().isEmpty()) || (id.isDouble() && id.toInteger() <= 0)) throw std::runtime_error("Account ID is missing from the extended account summary");
                     accountId = id.isString() ? id.toString() : QString::number(id.toInteger());
                     const QString identity = accountId + "/" + (engine.config.production ? "prod/" : "test/") + text(engine.config.instrument);
@@ -256,7 +267,7 @@ void Window::initialize(const QJsonObject&) {
     });
 }
 void Window::synchronize() {
-    syncing = true; ready = false; positionChecks = 0; reconcileLabels.clear(); reconcileIndex = 0; reconcileSnapshots.clear();
+    syncing = true; ready = false; positionChecks = 0; reconcileLabels.clear(); reconcileIndex = 0; reconcileSnapshots.clear(); absentCreates.clear();
     for (const auto& o : engine.orders()) if (o.live() || o.mutation != Mutation::None) reconcileLabels.push_back(o.label);
     // Classify once; preserve notification order within each role.
     std::stable_partition(reconcileLabels.begin(), reconcileLabels.end(), [this](const auto& label) {
@@ -283,6 +294,85 @@ void Window::synchronize() {
         } catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); }
     });
 }
+void Window::cancelProfileOrders(bool eraseProfile) {
+    const QString message = eraseProfile
+        ? "Cancel all entries and takes of THIS profile, then delete its saved settings and history? Other profiles are unchanged. Any exchange position remains open WITHOUT take protection. A fresh empty profile will be created in the same file."
+        : "Cancel all entries and takes of THIS profile despite the reconciliation error? The exchange position will remain open. Other profiles and manual orders are unchanged.";
+    if (QMessageBox::warning(this, eraseProfile ? "Delete current profile: " + QFileInfo(profilePath).fileName() : "Cancel bot orders", message, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+    if (!client.authenticated() || !accountLock || busy || recoveryCancelling || storageFailed) { log("Connect to the bound account before cancelling or deleting this profile"); return; }
+    // Invalidate incomplete read callbacks. Persist a cancel-only state before sending
+    // any idempotent label cancellation; an interrupted attempt retains the profile.
+    ++session; ready = false; syncing = true; busy = true; readBusy = false; recoveryCancelling = true;
+    engine.cancelAll(); save(); if (storageFailed) return; render(); const int epoch = session;
+    log("Cancelling exchange orders of this profile by exact labels; saved data retained until verification");
+    client.call("private/get_open_orders_by_instrument", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch, eraseProfile](const RpcResult& r) {
+        if (epoch != session) return;
+        try {
+            if (!r.ok || !r.value.isArray()) throw std::runtime_error("Cannot list orders for cancellation: " + r.error.toStdString());
+            QSet<QString> labels;
+            for (const auto& o : engine.orders()) if (o.live() || o.mutation != Mutation::None) labels.insert(text(o.label));
+            const auto prefix = "dg_" + text(engine.profileId) + "_";
+            for (const auto& v : r.value.toArray()) {
+                if (!v.isObject()) throw std::runtime_error("Invalid open order list");
+                const auto o = v.toObject();
+                if (o["instrument_name"].toString() != text(engine.config.instrument)) throw std::runtime_error("Wrong instrument in cancellation snapshot");
+                if (o["label"].toString().startsWith(prefix)) labels.insert(o["label"].toString());
+            }
+            QStringList ordered(labels.begin(), labels.end()); ordered.sort(); cancelProfileLabels(ordered, 0, eraseProfile);
+        } catch (const std::exception& ex) { busy = false; syncing = false; recoveryCancelling = false; fail(QString::fromUtf8(ex.what()) + "; profile retained"); }
+    });
+}
+void Window::cancelProfileLabels(const QStringList& labels, int index, bool eraseProfile) {
+    if (index >= labels.size()) { verifyProfileCancellation(eraseProfile, 0); return; }
+    const int epoch = session;
+    client.call("private/cancel_by_label", {{"currency", "USDC"}, {"label", labels[index]}}, [this, epoch, labels, index, eraseProfile](const RpcResult& r) {
+        if (epoch != session) return;
+        if (!r.ok || !r.value.isDouble() || r.value.toInteger(-1) < 0) {
+            busy = false; syncing = false; recoveryCancelling = false;
+            fail("Label cancellation not confirmed: " + (r.error.isEmpty() ? QString("invalid exchange response") : r.error) + "; profile retained. Reconnect / Reconcile, or retry Cancel all bot orders."); return;
+        }
+        cancelProfileLabels(labels, index + 1, eraseProfile);
+    }, true);
+}
+void Window::verifyProfileCancellation(bool eraseProfile, int checks) {
+    const int epoch = session;
+    // A second empty snapshot catches an order accepted just after the first cancel.
+    QTimer::singleShot(checks ? 2000 : 0, this, [this, epoch, eraseProfile, checks] {
+        if (epoch != session) return;
+        client.call("private/get_open_orders_by_instrument", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch, eraseProfile, checks](const RpcResult& r) {
+            if (epoch != session) return;
+            try {
+                if (!r.ok || !r.value.isArray()) throw std::runtime_error("Final cancellation check failed: " + r.error.toStdString());
+                for (const auto& v : r.value.toArray()) {
+                    if (!v.isObject() || v.toObject()["instrument_name"].toString() != text(engine.config.instrument) || v.toObject()["order_id"].toString().isEmpty())
+                        throw std::runtime_error("Invalid final cancellation snapshot");
+                    if (v.toObject()["label"].toString().startsWith("dg_" + text(engine.profileId) + "_"))
+                        throw std::runtime_error("A profile order is still open; retry Cancel all bot orders");
+                }
+                if (checks == 0) { verifyProfileCancellation(eraseProfile, 1); return; }
+                if (!eraseProfile) {
+                    busy = false; syncing = false; recoveryCancelling = false;
+                    log("All exchange orders of this profile cancelled; reconciling saved fills"); synchronize(); return;
+                }
+                client.call("private/get_position", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch](const RpcResult& p) {
+                    if (epoch != session) return;
+                    try {
+                        if (!p.ok) throw std::runtime_error("Cannot read remaining position: " + p.error.toStdString());
+                        Engine fresh; fresh.config.instrument = engine.config.instrument; fresh.config.production = engine.config.production; fresh.spec = engine.spec;
+                        fresh.profileId = QUuid::createUuid().toString(QUuid::Id128).left(16).toStdString();
+                        netPosition = accountPosition(p.value.toObject()); fresh.externalPosition = signedFixed(netPosition);
+                        store->resetProfile(fresh); engine = std::move(fresh); ++session; ++statsRevision;
+                        absentCreates.clear(); bufferedOrders = {}; bufferedTrades = {}; feeRequests.clear();
+                        sessionPnl = 0; sessionFees = 0; closedTrades = 0; feesUnavailable = false; statsReady = false;
+                        busy = false; syncing = false; recoveryCancelling = false; setConfig(engine.config);
+                        log("Current profile cleared and recreated; exchange position remains " + QString::number(netPosition, 'f', 8) + " coin. Set ranges and budgets before Start.");
+                        synchronize();
+                    } catch (const std::exception& ex) { busy = false; syncing = false; recoveryCancelling = false; fail(QString::fromUtf8(ex.what()) + "; profile retained"); }
+                });
+            } catch (const std::exception& ex) { busy = false; syncing = false; recoveryCancelling = false; fail(QString::fromUtf8(ex.what()) + "; profile retained"); }
+        });
+    });
+}
 void Window::reconcileNext() {
     // Reuse the bulk snapshot in entry-before-take order. Uncertain requests still need an explicit read.
     try {
@@ -302,16 +392,82 @@ void Window::reconcileNext() {
     const QJsonObject params = o->exchangeId.empty() ? QJsonObject{{"currency", "USDC"}, {"label", text(label)}} : QJsonObject{{"order_id", text(o->exchangeId)}};
     client.call(method, params, [this, epoch, label](const RpcResult& r) {
         if (epoch != session) return;
+        // A lost create acknowledgement can mean either an accepted order or a request
+        // which never reached the matching engine. Empty recent results alone prove neither.
+        if (r.ok && r.value.isArray() && r.value.toArray().isEmpty()) {
+            const auto snapshot = reconcileSnapshots.constFind(text(label));
+            if (snapshot != reconcileSnapshots.cend()) {
+                try { receiveOrder(snapshot.value(), true); reconcileNext(); }
+                catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); }
+            } else reconcileHistory(label, false, 0, 0);
+            return;
+        }
         QJsonObject snapshot;
         if (r.value.isArray()) {
             const auto matches = r.value.toArray();
             if (matches.size() == 1) snapshot = matches[0].toObject();
         } else if (r.value.isObject()) snapshot = r.value.toObject();
         if (!r.ok || snapshot["order_id"].toString().isEmpty() || snapshot["label"].toString() != text(label)) {
-            engine.uncertain(label); save(); fail("Cannot resolve saved order " + text(label) + ": " + r.error); syncing = false; return;
+            engine.uncertain(label); save(); syncing = false;
+            fail("Cannot resolve saved order " + text(label) + ": " + (r.error.isEmpty() ? QString("invalid or ambiguous exchange response; use Reconnect / Reconcile to retry") : r.error)); return;
         }
         try { receiveOrder(snapshot, true); reconcileNext(); }
         catch (const std::exception& ex) { fail(QString::fromUtf8(ex.what())); syncing = false; }
+    });
+}
+void Window::reconcileHistory(const std::string& label, bool historical, int offset, int pass) {
+    const int epoch = session;
+    client.call("private/get_order_history_by_instrument", {{"instrument_name", text(engine.config.instrument)},
+        {"count", 1000}, {"offset", offset}, {"include_old", true}, {"include_unfilled", true}, {"historical", historical}},
+        [this, epoch, label, historical, offset, pass](const RpcResult& r) {
+        if (epoch != session) return;
+        try {
+            if (!r.ok || !r.value.isArray()) throw std::runtime_error(("Order history reconciliation failed: " +
+                (r.error.isEmpty() ? QString("invalid exchange response") : r.error)).toStdString());
+            const auto history = r.value.toArray(); QJsonObject match;
+            for (const auto& v : history) {
+                if (!v.isObject() || v.toObject()["order_id"].toString().isEmpty()) throw std::runtime_error("Invalid order history record");
+                const auto order = v.toObject();
+                if (order["label"].toString() != text(label)) continue;
+                if (!match.isEmpty()) throw std::runtime_error("Duplicate bot label in order history");
+                match = order;
+            }
+            if (!match.isEmpty()) { receiveOrder(match, true); reconcileNext(); return; }
+            if (history.size() == 1000) {
+                if (offset >= 99000) throw std::runtime_error("Order history search limit reached; missing request remains unresolved");
+                reconcileHistory(label, historical, offset + 1000, pass); return;
+            }
+            if (!historical) { reconcileHistory(label, true, 0, pass); return; }
+            const auto* o = engine.order(label);
+            if (!o || !o->exchangeId.empty() || o->filled != 0 || o->mutation != Mutation::Create)
+                throw std::runtime_error("Saved accepted order is missing from the exchange; manual review required");
+            if (pass == 0) { confirmMissingCreate(label); return; }
+            // Defer releasing this intent until buffered notifications and account position
+            // have also been checked. Its label is never reused for a new request.
+            absentCreates.push_back(label); reconcileNext();
+        } catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); }
+    });
+}
+void Window::confirmMissingCreate(const std::string& label) {
+    const int epoch = session;
+    log("No exchange record for pending create " + text(label) + "; checking again before releasing its slot");
+    QTimer::singleShot(2000, this, [this, epoch, label] {
+        if (epoch != session) return;
+        client.call("private/get_open_orders_by_instrument", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch, label](const RpcResult& r) {
+            if (epoch != session) return;
+            try {
+                if (!r.ok || !r.value.isArray()) throw std::runtime_error("Cannot confirm open orders for missing create: " + r.error.toStdString());
+                QJsonObject match;
+                for (const auto& v : r.value.toArray()) {
+                    if (!v.isObject() || v.toObject()["order_id"].toString().isEmpty()) throw std::runtime_error("Invalid open order record");
+                    if (v.toObject()["label"].toString() != text(label)) continue;
+                    if (!match.isEmpty()) throw std::runtime_error("Duplicate bot label in open orders");
+                    match = v.toObject();
+                }
+                if (!match.isEmpty()) { receiveOrder(match, true); reconcileNext(); }
+                else reconcileHistory(label, false, 0, 1);
+            } catch (const std::exception& ex) { syncing = false; fail(QString::fromUtf8(ex.what())); }
+        });
     });
 }
 void Window::completeSync() {
@@ -328,8 +484,22 @@ void Window::completeSync() {
                     receiveOrders(bufferedOrders); bufferedOrders = {};
                     if (positionRevision != revision) { completeSync(); return; }
                     netPosition = accountPosition(r.value.toObject()); const Int actual = signedFixed(netPosition);
+                    // Do not adopt an unexplained position as the initial external offset
+                    // when deciding that an uncertain create was not accepted.
+                    if (!absentCreates.empty() && (!engine.positionMatches(actual) || (!engine.externalPosition && actual != engine.trackedPosition()))) {
+                        syncing = false; fail("Missing create cannot be released: account position does not match saved fills; use Reconnect / Reconcile after review"); return;
+                    }
                     if (!engine.positionMatches(actual) && positionChecks++ < 2) { QTimer::singleShot(250, this, [this, epoch] { if (epoch == session) completeSync(); }); return; }
                     const bool matched = engine.reconcilePosition(actual);
+                    if (matched) for (const auto& label : absentCreates) {
+                        const auto* o = engine.order(label);
+                        if (!o) throw std::runtime_error("Missing create during final reconciliation");
+                        if (!o->exchangeId.empty()) { engine.resolved(label); continue; }
+                        if (o->filled != 0 || o->mutation != Mutation::Create) throw std::runtime_error("Missing create changed during reconciliation");
+                        engine.rejected(label, "Unaccepted create reconciled; review and Start / Resume");
+                        log("Pending create absent from open orders and recent/historical records; released " + text(label) + ". Start / Resume is available.");
+                    }
+                    absentCreates.clear();
                     if (!matched) log("Position mismatch: " + positionDetails(engine, actual));
                     if (!statsReady) feesSince = QDateTime::currentMSecsSinceEpoch();
                     syncing = false; ready = true; statsReady = true; save();
@@ -536,9 +706,11 @@ void Window::render() {
     connectButton->setEnabled(!busy && !storageFailed && !closing); connectButton->setText(client.authenticated() ? "Reconnect / Reconcile" : "Connect");
     startButton->setEnabled(ready && !syncing && !busy && !engine.positionBlocked && !storageFailed && !closing && marketClock.isValid() && marketClock.elapsed() <= 10000);
     resetButton->setEnabled(ready && !syncing && !busy && !closing && !storageFailed && engine.canClearHistory());
-    applyButton->setEnabled(startButton->isEnabled()); pauseButton->setEnabled(ready); cancelButton->setEnabled(ready);
+    applyButton->setEnabled(startButton->isEnabled()); pauseButton->setEnabled(ready);
+    const bool canCancel = client.authenticated() && accountLock && !busy && !storageFailed && !closing;
+    cancelButton->setEnabled(canCancel); deleteProfileButton->setEnabled(canCancel);
     idBox->setEnabled(!client.authenticated()); secretBox->setEnabled(!client.authenticated());
-    connectionLabel->setText(syncing ? "Reconciling" : ready ? "Connected" : "Disconnected");
+    connectionLabel->setText(syncing ? "Reconciling" : ready ? "Connected" : client.authenticated() ? "Needs reconciliation" : "Disconnected");
     environmentBox->setStyleSheet(environmentBox->currentIndex() ? "color:#b91c1c;font-weight:bold" : "");
     QString mode = engine.positionBlocked ? "Position mismatch" : engine.cancelEverything ? "Cancelling all" : engine.blocked ? "Blocked" : engine.rebuilding ? "Rebuilding" : engine.running ? "Running" : "Paused";
     bool feesComplete = false;

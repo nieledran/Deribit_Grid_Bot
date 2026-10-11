@@ -3,6 +3,7 @@
 #include <QJsonParseError>
 #include <QSslError>
 #include <algorithm>
+#include <cmath>
 
 Client::Client(QObject* parent) : QObject(parent) {
     clock.start(); retry.setSingleShot(true); refresh.setSingleShot(true); watchdog.setInterval(1000);
@@ -38,6 +39,7 @@ Client::~Client() {
 }
 void Client::connectTo(const QString& id, const QString& secret, bool production, const QUrl& testEndpoint) {
     stop(); clientId = id; clientSecret = secret; wanted = true; retryMs = 1500;
+    mutationInterval = 250;
     endpoint = testEndpoint.isEmpty() ? QUrl(production ? "wss://www.deribit.com/ws/api/v2" : "wss://test.deribit.com/ws/api/v2") : testEndpoint;
     socket.open(endpoint);
 }
@@ -50,7 +52,7 @@ qint64 Client::call(const QString& method, const QJsonObject& params, Callback c
     if (socket.state() != QAbstractSocket::ConnectedState) {
         QTimer::singleShot(0, this, [callback] { callback({false, {}, "Not connected", false}); }); return id;
     }
-    pending.emplace(id, Pending{std::move(callback), clock.elapsed() + 15000 + static_cast<qint64>(outbound.size()) * 100, mutation});
+    pending.emplace(id, Pending{std::move(callback), clock.elapsed() + 15000 + static_cast<qint64>(outbound.size() + 1) * mutationInterval, mutation});
     const QJsonObject message{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
     outbound.emplace_back(id, message);
     if (!sendTimer.isActive()) sendTimer.start(static_cast<int>(std::max<qint64>(0, 100 - (clock.elapsed() - lastSent))));
@@ -58,11 +60,26 @@ qint64 Client::call(const QString& method, const QJsonObject& params, Callback c
 }
 void Client::sendNext() {
     if (outbound.empty() || socket.state() != QAbstractSocket::ConnectedState) return;
+    const auto queued = pending.find(outbound.front().first);
+    const bool mutation = queued != pending.end() && queued->second.mutation;
+    const qint64 now = clock.elapsed();
+    const qint64 delay = std::max<qint64>(100 - (now - lastSent), mutation ? mutationInterval - (now - lastMutation) : 0);
+    if (delay > 0) { sendTimer.start(static_cast<int>(delay)); return; }
     const auto [id, message] = outbound.front(); outbound.pop_front(); lastSent = clock.elapsed();
+    if (mutation) lastMutation = lastSent;
     if (auto it = pending.find(id); it != pending.end()) it->second.deadline = lastSent + 15000;
-    // Pace all RPCs at ten per second; trading mutations are also serialized by the engine.
+    // Read RPCs stay at ten per second; mutations additionally respect the account's
+    // sustained limit with headroom. Immediate continuation still avoids a pump-timer gap.
     socket.sendTextMessage(QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)));
     if (!outbound.empty()) sendTimer.start(100);
+}
+void Client::setTradingLimits(const QJsonObject& limits) {
+    auto matching = limits["matching_engine"].toObject();
+    if (limits["limits_per_currency"].toBool()) matching = matching["usdc"].toObject();
+    const double rate = matching["trading"].toObject()["total"].toObject()["rate"].toDouble();
+    mutationInterval = std::isfinite(rate) && rate >= 1 ? static_cast<int>(std::max(100.0, std::ceil(1250.0 / rate))) : 250;
+    emit notice(QString("Trading RPC pacing: at most %1 requests/s in this window; account limits are shared with other clients")
+        .arg(1000.0 / mutationInterval, 0, 'f', 1));
 }
 void Client::authenticate(bool renew) {
     QJsonObject params = renew && !refreshToken.isEmpty()
@@ -98,7 +115,10 @@ void Client::receive(const QString& message) {
             const auto e = o["error"].toObject();
             const QString text = QString("API error %1: %2").arg(e["code"].toInt()).arg(e["message"].toString());
             const int code = e["code"].toInt();
-            const bool ambiguous = p.mutation && (code == 10050 || code == 10028);
+            // 10028 explicitly rejects this request; only a missing response or
+            // matching-engine timeout leaves its outcome uncertain.
+            const bool ambiguous = p.mutation && code == 10050;
+            if (code == 10028) emit notice(text + "; exchange rate limit reached");
             p.callback({false, {}, text, ambiguous});
         } else if (o.contains("result")) p.callback({true, o["result"], {}, false});
         else { p.callback({false, {}, "Invalid JSON-RPC response", p.mutation}); socket.abort(); }

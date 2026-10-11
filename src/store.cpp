@@ -142,6 +142,18 @@ Store::Store(const QString& path) {
     } catch (...) { db.close(); db = {}; QSqlDatabase::removeDatabase(connection); throw; }
 }
 Store::~Store() { db.close(); db = {}; QSqlDatabase::removeDatabase(connection); }
+void Store::resetProfile(const Engine& fresh) {
+    if (!db.transaction()) throw std::runtime_error("Cannot begin profile reset");
+    try {
+        QSqlQuery q(db);
+        sqlCheck(q.exec("DELETE FROM archive"), q); sqlCheck(q.exec("DELETE FROM state"), q);
+        sqlCheck(q.exec("DELETE FROM fees"), q); sqlCheck(q.exec("DELETE FROM fee_trades"), q);
+        sqlCheck(q.prepare("INSERT INTO state (id, payload) VALUES (1, ?)"), q);
+        q.addBindValue(QJsonDocument(encodeEngine(fresh)).toJson(QJsonDocument::Compact)); sqlCheck(q.exec(), q);
+        if (!db.commit()) throw std::runtime_error("Cannot commit profile reset");
+        lastEngine = nullptr; lastSaved.clear(); lastMetadata = {}; lastRevision = ~std::uint64_t(0);
+    } catch (...) { db.rollback(); throw; }
+}
 bool Store::load(Engine& e) {
     QSqlQuery q(db); sqlCheck(q.exec("SELECT payload FROM state WHERE id=1"), q); if (!q.next()) return false;
     QJsonParseError error; auto doc = QJsonDocument::fromJson(q.value(0).toByteArray(), &error);

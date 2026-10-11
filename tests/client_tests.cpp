@@ -6,6 +6,35 @@
 class ClientTests : public QObject {
     Q_OBJECT
 private slots:
+    void rateLimitRejectionAndPacing_data() {
+        QTest::addColumn<bool>("perCurrency");
+        QTest::newRow("account") << false; QTest::newRow("USDC") << true;
+    }
+    void rateLimitRejectionAndPacing() {
+        QFETCH(bool, perCurrency);
+        QWebSocketServer server("Rate limit simulator", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        Client client; QSignalSpy authenticated(&client, &Client::authenticatedSession); QList<qint64> times;
+        QElapsedTimer elapsed; elapsed.start(); int completed = 0; bool uncertain = true;
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString();
+                QJsonObject response{{"jsonrpc", "2.0"}, {"id", j["id"]}};
+                if (method == "private/buy") {
+                    times.append(elapsed.elapsed()); response["error"] = QJsonObject{{"code", 10028}, {"message", "too_many_requests"}};
+                } else response["result"] = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson()));
+            });
+        });
+        client.connectTo("fake", "secret", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        const QJsonObject trading{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 5}}}}}};
+        client.setTradingLimits({{"limits_per_currency", perCurrency}, {"matching_engine", perCurrency ? QJsonObject{{"usdc", trading}} : trading}});
+        for (int i = 0; i < 3; ++i) client.call("private/buy", {}, [&](const RpcResult& r) { uncertain = r.uncertain; ++completed; QVERIFY(!r.ok); }, true);
+        QTRY_COMPARE(completed, 3); QVERIFY(!uncertain); QCOMPARE(times.size(), 3);
+        QVERIFY(times[1] - times[0] >= 220); QVERIFY(times[2] - times[1] >= 220);
+        client.stop();
+    }
     void destructionWithPendingRequests() {
         QWebSocketServer server("Destruction simulator", QWebSocketServer::NonSecureMode);
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));

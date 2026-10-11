@@ -12,6 +12,168 @@ using namespace grid;
 class WindowTests : public QObject {
     Q_OBJECT
 private slots:
+    void missingCreateRecovery_data() {
+        QTest::addColumn<QString>("scenario");
+        for (const auto& name : {"absent", "delayed-open", "historical-filled", "historical-cancelled", "ambiguous", "history-error", "position-mismatch"})
+            QTest::newRow(name) << QString(name);
+    }
+    void missingCreateRecovery() {
+        QFETCH(QString, scenario);
+        QTemporaryDir directory; QVERIFY(directory.isValid()); const auto path = directory.filePath("uncertain.db");
+        Engine seed; seed.profileId = "missingcreate"; seed.config.instrument = "ETH_USDC-PERPETUAL";
+        seed.spec = {Scale / 100, Scale / 10000, {}}; seed.externalPosition = 0;
+        seed.config.longs = {2480 * Scale, 2500 * Scale, 100 * Dollars, 2};
+        seed.importCycle({1, 1, Side::Long, 2490 * Scale, 2500 * Scale, 40, 0, false});
+        Order pending; pending.label = "dg_missingcreate_1_e_1"; pending.cycle = 1; pending.price = 2490 * Scale;
+        pending.total = pending.desiredTotal = 40; pending.status = Status::Uncertain; pending.mutation = Mutation::Create;
+        seed.importOrder(pending); seed.nextCycle = seed.nextOrder = 2; seed.blocked = true;
+        { Store db(path); db.save(seed); }
+        const auto saved = [&] { Store db(path); Engine e; db.load(e); return e; };
+        QJsonObject accepted{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"order_id", "exchange-entry"}, {"label", QString::fromStdString(pending.label)},
+            {"order_type", "limit"}, {"order_state", "open"}, {"direction", "buy"}, {"price", 2490.0},
+            {"amount", 0.004}, {"filled_amount", 0.0}, {"last_update_timestamp", 1}};
+        if (scenario.startsWith("historical")) accepted["order_state"] = scenario == "historical-filled" ? "filled" : "cancelled";
+        if (scenario == "historical-filled") accepted["filled_amount"] = 0.004;
+        int openReads = 0, historyReads = 0, entryCreates = 0, takeCreates = 0; bool paginationSeen = false, historyFlagsOK = true;
+        QHash<QString, QJsonObject> placed;
+        QWebSocketServer server("Missing create recovery", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString(); const auto p = j["params"].toObject();
+                QJsonValue result = QJsonObject{{"ok", true}}; QJsonObject error;
+                if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 9854321}};
+                else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"base_currency", "ETH"},
+                    {"settlement_currency", "USDC"}, {"kind", "future"}, {"settlement_period", "perpetual"}, {"state", "open"},
+                    {"tick_size", 0.01}, {"min_trade_amount", 0.0001}, {"contract_size", 0.0001}};
+                else if (method == "public/ticker") result = QJsonObject{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"best_bid_price", 2499.99}, {"best_ask_price", 2500.01}};
+                else if (method == "private/get_order_state_by_label") result = scenario == "ambiguous" ? QJsonArray{accepted, accepted} : QJsonArray{};
+                else if (method == "private/get_open_orders_by_instrument") {
+                    ++openReads; QJsonArray open;
+                    if (scenario == "delayed-open" && openReads > 1 && accepted["order_state"] == "open") open.append(accepted);
+                    for (const auto& o : placed) if (o["order_state"] == "open") open.append(o);
+                    result = open;
+                } else if (method == "private/get_order_history_by_instrument") {
+                    ++historyReads;
+                    historyFlagsOK &= p["include_old"].toBool() && p["include_unfilled"].toBool() && p["count"].toInt() == 1000;
+                    if (scenario == "history-error") error = {{"code", 10050}, {"message", "simulated history failure"}};
+                    QJsonArray history;
+                    if (scenario == "historical-filled" && !p["historical"].toBool()) {
+                        if (p["offset"].toInt() == 0) for (int i = 0; i < 1000; ++i) history.append(QJsonObject{{"order_id", QString::number(i)}, {"label", "unrelated"}});
+                        else paginationSeen = p["offset"].toInt() == 1000;
+                    }
+                    if (scenario.startsWith("historical") && p["historical"].toBool()) history.append(accepted);
+                    result = history;
+                } else if (method == "private/get_position") result = QJsonObject{{"size_currency", scenario == "historical-filled" ? 0.004 : scenario == "position-mismatch" ? 0.0001 : 0.0}};
+                else if (method == "private/get_user_trades_by_order") result = QJsonArray{};
+                else if (method == "private/buy" || method == "private/sell") {
+                    if (p["label"].toString().contains("_e_")) ++entryCreates; else ++takeCreates;
+                    auto o = accepted; o["order_id"] = "take-" + p["label"].toString(); o["label"] = p["label"]; o["direction"] = method == "private/buy" ? "buy" : "sell";
+                    o["price"] = p["price"]; o["amount"] = p["amount"]; o["filled_amount"] = 0.0; o["order_state"] = "open"; o["last_update_timestamp"] = 2;
+                    placed.insert(o["order_id"].toString(), o); result = QJsonObject{{"order", o}};
+                } else if (method == "private/cancel") {
+                    accepted["order_state"] = "cancelled"; accepted["last_update_timestamp"] = 2; result = accepted;
+                }
+                QJsonObject response{{"jsonrpc", "2.0"}, {"id", j["id"]}};
+                response.insert(error.isEmpty() ? "result" : "error", error.isEmpty() ? result : QJsonValue(error));
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson()));
+            });
+        });
+        Window window(path, "ETH_USDC-PERPETUAL", nullptr, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake"); window.findChild<QPushButton*>("connect")->click();
+        auto* start = window.findChild<QPushButton*>("start"); auto* journal = window.findChild<QPlainTextEdit*>();
+        const bool failure = scenario == "ambiguous" || scenario == "history-error" || scenario == "position-mismatch";
+        if (failure) {
+            QTRY_VERIFY_WITH_TIMEOUT(journal->toPlainText().contains(scenario == "ambiguous" ? "invalid or ambiguous" : scenario == "history-error" ? "history reconciliation failed" : "position does not match"), 10000);
+            QVERIFY(!start->isEnabled()); QCOMPARE(saved().order(pending.label)->mutation, Mutation::Create);
+            QVERIFY(saved().order(pending.label)->exchangeId.empty());
+        } else {
+            QTRY_VERIFY_WITH_TIMEOUT(start->isEnabled(), 10000);
+            QTRY_COMPARE_WITH_TIMEOUT(saved().order(pending.label)->mutation, Mutation::None, 5000);
+            if (scenario == "absent") {
+                QCOMPARE(saved().order(pending.label)->status, Status::Rejected); QVERIFY(openReads >= 2); QVERIFY(historyReads >= 4);
+            } else if (scenario == "historical-filled") {
+                QTRY_COMPARE_WITH_TIMEOUT(takeCreates, 1, 5000); QCOMPARE(saved().trackedPosition(), Int(400000)); QVERIFY(paginationSeen);
+            } else QTRY_COMPARE_WITH_TIMEOUT(saved().order(pending.label)->status, Status::Terminal, 5000);
+        }
+        QVERIFY(window.findChild<QPushButton*>("cancelBotOrders")->isEnabled());
+        QVERIFY(window.findChild<QPushButton*>("deleteProfile")->isEnabled());
+        QCOMPARE(entryCreates, 0); QVERIFY(historyFlagsOK);
+        QCOMPARE(saved().profileId, seed.profileId);
+    }
+    void cancellationAndProfileResetWhileBlocked_data() {
+        QTest::addColumn<bool>("erase"); QTest::addColumn<bool>("cancelError");
+        QTest::newRow("cancel-only") << false << false;
+        QTest::newRow("delete-current-only") << true << false;
+        QTest::newRow("failed-cancel-retains-profile") << true << true;
+    }
+    void cancellationAndProfileResetWhileBlocked() {
+        QFETCH(bool, erase); QFETCH(bool, cancelError);
+        QTemporaryDir directory; QVERIFY(directory.isValid()); const auto path = directory.filePath("blocked.db"), otherPath = directory.filePath("other.db");
+        Engine seed; seed.profileId = "blockedprofile"; seed.config.instrument = "ETH_USDC-PERPETUAL"; seed.spec = {Scale / 100, Scale / 10000, {}};
+        seed.externalPosition = 0; seed.config.longs = {2480 * Scale, 2500 * Scale, 100 * Dollars, 2};
+        seed.importCycle({1, 1, Side::Long, 2490 * Scale, 2500 * Scale, 40, 0, false});
+        Order intent; intent.label = "dg_blockedprofile_1_e_1"; intent.cycle = 1; intent.price = 2490 * Scale;
+        intent.total = intent.desiredTotal = 40; intent.mutation = Mutation::Create; intent.status = Status::Uncertain; seed.importOrder(intent);
+        seed.nextCycle = seed.nextOrder = 2;
+        { Store db(path); db.save(seed); Store other(otherPath); other.save(seed); }
+        const auto saved = [&](const QString& file) { Store db(file); Engine e; db.load(e); return e; };
+        QJsonObject own{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"order_id", "own-exchange"}, {"label", QString::fromStdString(intent.label)},
+            {"order_type", "limit"}, {"order_state", "open"}, {"direction", "buy"}, {"price", 2490.0}, {"amount", 0.004}, {"filled_amount", 0.0}, {"last_update_timestamp", 1}};
+        auto manual = own; manual["order_id"] = "manual-exchange"; manual["label"] = "manual";
+        auto otherBot = own; otherBot["order_id"] = "other-exchange"; otherBot["label"] = "dg_otherprofile_1_e_1";
+        QStringList cancelled; int entryCreates = 0;
+        QWebSocketServer server("Blocked cancellation", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString(); const auto p = j["params"].toObject();
+                QJsonValue result = QJsonObject{{"ok", true}}; QJsonObject error;
+                if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 4854321}};
+                else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"base_currency", "ETH"},
+                    {"settlement_currency", "USDC"}, {"kind", "future"}, {"settlement_period", "perpetual"}, {"state", "open"},
+                    {"tick_size", 0.01}, {"min_trade_amount", 0.0001}, {"contract_size", 0.0001}};
+                else if (method == "public/ticker") result = QJsonObject{{"instrument_name", "ETH_USDC-PERPETUAL"}, {"best_bid_price", 2499.99}, {"best_ask_price", 2500.01}};
+                else if (method == "private/get_order_state_by_label") result = own["order_state"] == "open" ? QJsonValue(QJsonObject{}) : QJsonValue(QJsonArray{own});
+                else if (method == "private/get_open_orders_by_instrument") {
+                    QJsonArray open{manual, otherBot}; if (own["order_state"] == "open") open.append(own); result = open;
+                } else if (method == "private/cancel_by_label") {
+                    cancelled.append(p["label"].toString());
+                    if (cancelError) error = {{"code", 10050}, {"message", "simulated cancellation failure"}};
+                    else { own["order_state"] = "cancelled"; own["last_update_timestamp"] = 2; result = 1; }
+                } else if (method == "private/get_position") result = QJsonObject{{"size_currency", erase ? 0.004 : 0.0}};
+                else if (method == "private/get_user_trades_by_order") result = QJsonArray{};
+                else if (method == "private/buy" || method == "private/sell") ++entryCreates;
+                QJsonObject response{{"jsonrpc", "2.0"}, {"id", j["id"]}};
+                response.insert(error.isEmpty() ? "result" : "error", error.isEmpty() ? result : QJsonValue(error));
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson()));
+            });
+        });
+        Window window(path, "ETH_USDC-PERPETUAL", nullptr, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake"); window.findChild<QPushButton*>("connect")->click();
+        auto* journal = window.findChild<QPlainTextEdit*>();
+        QTRY_VERIFY_WITH_TIMEOUT(journal->toPlainText().contains("invalid or ambiguous"), 5000);
+        QVERIFY(!window.findChild<QPushButton*>("start")->isEnabled());
+        auto* cancel = window.findChild<QPushButton*>(erase ? "deleteProfile" : "cancelBotOrders"); QVERIFY(cancel->isEnabled());
+        QTimer::singleShot(0, [] { if (auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) dialog->button(QMessageBox::Yes)->click(); });
+        cancel->click();
+        if (cancelError) {
+            QTRY_VERIFY_WITH_TIMEOUT(journal->toPlainText().contains("profile retained"), 5000);
+            QCOMPARE(saved(path).profileId, seed.profileId); QCOMPARE(saved(path).orders().size(), size_t(1)); QVERIFY(cancel->isEnabled());
+        } else if (erase) {
+            QTRY_VERIFY_WITH_TIMEOUT(saved(path).profileId != seed.profileId, 8000);
+            QVERIFY(saved(path).orders().empty()); QVERIFY(saved(path).cycles().empty()); QCOMPARE(saved(path).config.longs.budget, Int(0));
+            QCOMPARE(saved(path).externalPosition, std::optional<Int>(400000));
+        } else {
+            QTRY_VERIFY_WITH_TIMEOUT(window.findChild<QPushButton*>("start")->isEnabled(), 8000);
+            QCOMPARE(saved(path).profileId, seed.profileId); QCOMPARE(saved(path).order(intent.label)->status, Status::Terminal);
+        }
+        QCOMPARE(cancelled, QStringList{QString::fromStdString(intent.label)}); QCOMPARE(entryCreates, 0);
+        QCOMPARE(saved(otherPath).profileId, seed.profileId); QCOMPARE(saved(otherPath).orders().size(), size_t(1));
+        QCOMPARE(manual["order_state"].toString(), QString("open")); QCOMPARE(otherBot["order_state"].toString(), QString("open"));
+    }
     void fillsDoNotLeaveFiveSecondTakeGaps_data() {
         QTest::addColumn<bool>("eth");
         QTest::newRow("BTC") << false;
@@ -65,7 +227,8 @@ private slots:
                 if (recovering) qInfo() << instrument << "recovery ms:" << protectionClock.elapsed() << method;
                 QJsonValue result = QJsonObject{{"ok", true}};
                 if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
-                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 123454321}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 123454321}, {"limits", QJsonObject{
+                    {"matching_engine", QJsonObject{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 100}}}}}}}}}};
                 else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", instrument}, {"base_currency", eth ? "ETH" : "BTC"},
                     {"settlement_currency", "USDC"}, {"kind", "future"}, {"settlement_period", "perpetual"}, {"state", "open"},
                     {"tick_size", eth ? 0.01 : 0.1}, {"min_trade_amount", 0.0001}, {"contract_size", 0.0001}};
