@@ -173,6 +173,14 @@ void limitsAndUncertainty() {
     e.uncertain(entry.label); check(!e.nextAction(), "Unknown placement may not be retried");
     e.disconnected(); check(!e.nextAction(), "Disconnect freezes mutations until reconciliation");
     ack(e, entry); check(e.orders().size() == 1, "Reconciliation must not duplicate the original order");
+    e = setup(2); entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry);
+    e.disconnected(); check(e.running && !e.nextAction(), "Running grid waits for order reconciliation");
+    ack(e, entry); auto continued = requireAction(e, Mutation::Create, Role::Entry);
+    check(continued.label != entry.label, "Existing grid continues without duplicating the recovered entry"); ack(e, continued);
+    e.pause(); e.disconnected(); check(!e.running, "Disconnect must not undo a manual pause");
+    e = setup(); const auto requested = e.pendingConfig;
+    e.disconnected(); check(e.rebuilding && e.pendingConfig && e.pendingConfig->shorts.budget == requested->shorts.budget &&
+        e.pendingConfig->shorts.levels == requested->shorts.levels, "Disconnect preserves an accepted rebuild");
 }
 void switchingAndConflicts() {
     auto e = setup(2, true); auto entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry);
@@ -244,7 +252,7 @@ void autoRebuildProtectsRacedFills() {
     e.apply(snapshot(*e.order(take.label), 1, true, 4)); verifyTotals(e);
     const auto fresh = requireAction(e, Mutation::Create, Role::Entry);
     check(fresh.price == p(2437.5), "New freed slot uses the latest long anchor");
-    e.disconnected(); check(!e.running && !e.nextAction(), "Connection loss has priority over grid transfer");
+    e.disconnected(); check(e.running && !e.nextAction(), "Connection loss freezes grid transfer without losing run intent");
     Engine slots; slots.profileId = "slots"; slots.spec = e.spec; slots.config.longs = e.config.longs; slots.config.longs.levels = 14;
     check(slots.availableSlots(Side::Long) == 14, "Initial display is 14/14");
     for (int i = 0; i < 4; ++i) {

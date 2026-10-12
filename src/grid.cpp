@@ -251,7 +251,8 @@ void Engine::uncertain(const std::string& label) {
     blocked = true; problem = "Uncertain request outcome: exchange reconciliation required";
 }
 void Engine::disconnected() {
-    pause();
+    // Freeze order mutations until reconciliation, retaining the current run/rebuild intent.
+    // The window's readiness gate also prevents trading while the connection is down.
     for (auto& o : orders_) if (o.live() || o.mutation != Mutation::None) {
         o.status = Status::Uncertain; refreshOrder(labelIndex_.at(o.label));
     }

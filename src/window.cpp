@@ -177,6 +177,7 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     });
     connect(&client, &Client::notice, this, &Window::log);
     connect(&client, &Client::lost, this, [this] {
+        marketClock.invalidate();
         ++session; ready = false; syncing = false; busy = false; recoveryCancelling = false; readBusy = false; feeRequests.clear(); engine.disconnected(); save();
         log("Disconnected: exchange orders remain; waiting for reconciliation"); render();
     });
@@ -294,7 +295,13 @@ void Window::initialize(const QJsonObject&) {
                         const QJsonArray channels{"ticker." + instrument + ".100ms", "user.changes." + instrument + ".100ms"};
                         client.call("private/subscribe", {{"channels", channels}}, [this, epoch](const RpcResult& sub) {
                             if (epoch != session) return;
-                            if (!sub.ok) { fail(sub.error); return; } synchronize();
+                            if (!sub.ok) { fail(sub.error); return; }
+                            client.call("public/ticker", {{"instrument_name", text(engine.config.instrument)}}, [this, epoch](const RpcResult& ticker) {
+                                if (epoch != session) return;
+                                if (!ticker.ok) { fail(ticker.error); return; }
+                                try { readMarket(ticker.value.toObject()); synchronize(); }
+                                catch (const std::exception& e) { fail(QString::fromUtf8(e.what())); }
+                            });
                         });
                     });
                 } catch (const std::exception& ex) { fail(QString::fromUtf8(ex.what())); client.stop(); }
@@ -753,7 +760,7 @@ void Window::render() {
     connectButton->setEnabled(!busy && !storageFailed && !closing); connectButton->setText(client.authenticated() ? "Reconnect / Reconcile" : "Connect");
     startButton->setEnabled(ready && !syncing && !busy && !engine.positionBlocked && !storageFailed && !closing && marketClock.isValid() && marketClock.elapsed() <= 10000);
     resetButton->setEnabled(ready && !syncing && !busy && !closing && !storageFailed && engine.canClearHistory());
-    applyButton->setEnabled(startButton->isEnabled()); pauseButton->setEnabled(ready);
+    applyButton->setEnabled(startButton->isEnabled()); pauseButton->setEnabled(ready || engine.running || engine.rebuilding);
     const bool canCancel = client.authenticated() && accountLock && !busy && !storageFailed && !closing;
     cancelButton->setEnabled(canCancel); deleteProfileButton->setEnabled(canCancel);
     idBox->setEnabled(!client.authenticated()); secretBox->setEnabled(!client.authenticated());

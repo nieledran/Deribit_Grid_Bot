@@ -386,6 +386,15 @@ private slots:
         QCOMPARE(saved().availableSlots(Side::Short), 12); QVERIFY(saved().running); QVERIFY(!saved().positionBlocked);
         QVERIFY(window.findChild<QPlainTextEdit*>()->toPlainText().contains("account position. Running."));
 
+        // Reuse the existing exchange simulator to exercise a real reconnect in both instruments.
+        QVERIFY(settleAccountRead()); const auto ordersBeforeReconnect = orders.size();
+        const auto cancellationsBeforeReconnect = cancelled.size();
+        peer->close();
+        QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text(), QString("Disconnected"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text(), QString("Connected"), 10000);
+        QVERIFY(saved().running); QVERIFY(!saved().rebuilding);
+        QCOMPARE(orders.size(), ordersBeforeReconnect); QCOMPARE(cancelled.size(), cancellationsBeforeReconnect);
+
         // A real external change still blocks entries and keeps the accepted takes intact.
         QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 1000);
         QVERIFY(settleAccountRead());
