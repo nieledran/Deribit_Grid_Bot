@@ -6,6 +6,63 @@
 class ClientTests : public QObject {
     Q_OBJECT
 private slots:
+    void latencyTracksRepliesSlowWaitAndDisconnect() {
+        QWebSocketServer server("Latency", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        Client client; QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        QWebSocket* peer = nullptr; QJsonValue delayedId;
+        const auto reply = [](QWebSocket* socket, const QJsonValue& id) {
+            socket->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"id", id}, {"result", QJsonObject{{"expires_in", 3600}}}}).toJson()));
+        };
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                if (j["method"] == "read/delayed") delayedId = j["id"];
+                else if (j["method"] == "read/measured") QTimer::singleShot(200, peer, [&, id = j["id"]] { reply(peer, id); });
+                else reply(peer, j["id"]);
+            });
+        });
+        using State = Client::ConnectionStatus::State;
+        QCOMPARE(client.connectionStatus().state, State::Idle);
+        client.connectTo("fake", "fake", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        bool measured = false; client.call("read/measured", {}, [&](const RpcResult&) { measured = true; });
+        QTRY_VERIFY(measured);
+        const auto normal = client.connectionStatus(); QVERIFY(normal.milliseconds >= 150); QVERIFY(normal.milliseconds < 1000); QVERIFY(!normal.slow);
+        bool delayed = false; client.call("read/delayed", {}, [&](const RpcResult&) { delayed = true; });
+        QTRY_VERIFY(!delayedId.isUndefined());
+        QTRY_VERIFY_WITH_TIMEOUT(client.connectionStatus().slow, 3000);
+        QVERIFY(client.connectionStatus().waiting); QVERIFY(client.connectionStatus().milliseconds >= 2000);
+        // Incoming notifications do not hide a stalled RPC.
+        peer->sendTextMessage("{\"method\":\"subscription\",\"params\":{\"channel\":\"ticker.test\",\"data\":{}}}");
+        QTest::qWait(50); QVERIFY(client.connectionStatus().slow);
+        reply(peer, delayedId); QTRY_VERIFY(delayed); QVERIFY(client.connectionStatus().slow);
+        bool fast = false; client.call("read/fast", {}, [&](const RpcResult&) { fast = true; }); QTRY_VERIFY(fast);
+        QVERIFY(!client.connectionStatus().slow); QVERIFY(client.connectionStatus().milliseconds < 1000);
+        peer->close(); QTRY_COMPARE(client.connectionStatus().state, State::Offline);
+        QVERIFY(client.connectionStatus().slow); QCOMPARE(client.connectionStatus().milliseconds, qint64(-1));
+        client.stop(); QCOMPARE(client.connectionStatus().state, State::Idle);
+    }
+    void latencyExcludesTradingPacingQueue() {
+        QWebSocketServer server("Queued latency", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        Client client; QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [peer](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"id", j["id"]}, {"result", QJsonObject{{"expires_in", 3600}}}}).toJson()));
+            });
+        });
+        client.connectTo("fake", "fake", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        client.setTradingLimits({{"matching_engine", QJsonObject{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 1}}}}}}}});
+        int completed = 0; QElapsedTimer wait; wait.start();
+        for (int i = 0; i < 3; ++i) client.call("private/buy", {}, [&](const RpcResult&) { ++completed; }, true);
+        QTRY_COMPARE_WITH_TIMEOUT(completed, 2, 4000);
+        QVERIFY(wait.elapsed() >= 1800); // Third request has waited in the local queue, not on the network.
+        QVERIFY(!client.connectionStatus().slow); QVERIFY(client.connectionStatus().milliseconds < 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(completed, 3, 3000); client.stop();
+    }
     void rateLimitRejectionAndPacing_data() {
         QTest::addColumn<bool>("perCurrency");
         QTest::newRow("account") << false; QTest::newRow("USDC") << true;

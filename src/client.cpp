@@ -9,12 +9,13 @@ Client::Client(QObject* parent) : QObject(parent) {
     clock.start(); retry.setSingleShot(true); refresh.setSingleShot(true); watchdog.setInterval(1000);
     sendTimer.setSingleShot(true);
     connect(&sendTimer, &QTimer::timeout, this, &Client::sendNext);
-    connect(&retry, &QTimer::timeout, this, [this] { if (wanted) socket.open(endpoint); });
+    connect(&retry, &QTimer::timeout, this, [this] { if (wanted) { connectionStarted = clock.elapsed(); socket.open(endpoint); } });
     connect(&refresh, &QTimer::timeout, this, [this] { authenticate(true); });
-    connect(&socket, &QWebSocket::connected, this, [this] { lastMessage = clock.elapsed(); authenticate(false); });
+    connect(&socket, &QWebSocket::connected, this, [this] { lastMessage = clock.elapsed(); connectionFailed = false; authenticate(false); });
     connect(&socket, &QWebSocket::disconnected, this, &Client::disconnected);
     connect(&socket, &QWebSocket::textMessageReceived, this, &Client::receive);
     connect(&socket, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        connectionFailed = true; lastLatency = -1;
         emit notice("WebSocket: " + socket.errorString());
         if (wanted && socket.state() == QAbstractSocket::UnconnectedState && !retry.isActive()) retry.start(retryMs);
     });
@@ -39,6 +40,7 @@ Client::~Client() {
 }
 void Client::connectTo(const QString& id, const QString& secret, bool production, const QUrl& testEndpoint) {
     stop(); clientId = id; clientSecret = secret; wanted = true; retryMs = 1500;
+    connectionStarted = clock.elapsed();
     mutationInterval = 250;
     endpoint = testEndpoint.isEmpty() ? QUrl(production ? "wss://www.deribit.com/ws/api/v2" : "wss://test.deribit.com/ws/api/v2") : testEndpoint;
     socket.open(endpoint);
@@ -46,6 +48,24 @@ void Client::connectTo(const QString& id, const QString& secret, bool production
 void Client::stop() {
     wanted = false; authorized = false; retry.stop(); refresh.stop(); sendTimer.stop(); outbound.clear(); pending.clear();
     socket.abort(); clientSecret.clear(); refreshToken.clear();
+    connectionFailed = false; lastLatency = -1;
+}
+Client::ConnectionStatus Client::connectionStatus() const {
+    ConnectionStatus status;
+    const qint64 now = clock.elapsed();
+    if (socket.state() != QAbstractSocket::ConnectedState) {
+        if (!wanted) { status.state = connectionFailed ? ConnectionStatus::State::Offline : ConnectionStatus::State::Idle; return status; }
+        if (socket.state() == QAbstractSocket::UnconnectedState) { status.state = ConnectionStatus::State::Offline; status.slow = true; return status; }
+        status.state = ConnectionStatus::State::Connecting;
+        status.milliseconds = now - connectionStarted; status.waiting = true;
+        status.slow = connectionFailed || status.milliseconds >= 2000; return status;
+    }
+    status.state = ConnectionStatus::State::Online; status.milliseconds = lastLatency;
+    qint64 waiting = -1;
+    for (const auto& [id, p] : pending) { Q_UNUSED(id); if (p.sentAt >= 0) waiting = std::max(waiting, now - p.sentAt); }
+    if (waiting >= 2000) { status.milliseconds = waiting; status.waiting = true; }
+    status.slow = connectionFailed || status.milliseconds >= 2000 || now - lastMessage >= 15000;
+    return status;
 }
 qint64 Client::call(const QString& method, const QJsonObject& params, Callback callback, bool mutation) {
     const auto id = ++sequence;
@@ -67,7 +87,7 @@ void Client::sendNext() {
     if (delay > 0) { sendTimer.start(static_cast<int>(delay)); return; }
     const auto [id, message] = outbound.front(); outbound.pop_front(); lastSent = clock.elapsed();
     if (mutation) lastMutation = lastSent;
-    if (auto it = pending.find(id); it != pending.end()) it->second.deadline = lastSent + 15000;
+    if (auto it = pending.find(id); it != pending.end()) { it->second.deadline = lastSent + 15000; it->second.sentAt = lastSent; }
     // Read RPCs stay at ten per second; mutations additionally respect the account's
     // sustained limit with headroom. Immediate continuation still avoids a pump-timer gap.
     socket.sendTextMessage(QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)));
@@ -111,6 +131,7 @@ void Client::receive(const QString& message) {
     if (o.contains("id")) {
         const qint64 id = o["id"].toInteger(); auto it = pending.find(id); if (it == pending.end()) return;
         auto p = std::move(it->second); pending.erase(it);
+        if (p.sentAt >= 0 && (o.contains("result") || o.contains("error"))) lastLatency = clock.elapsed() - p.sentAt;
         if (o.contains("error")) {
             const auto e = o["error"].toObject();
             const QString text = QString("API error %1: %2").arg(e["code"].toInt()).arg(e["message"].toString());
@@ -129,6 +150,7 @@ void Client::receive(const QString& message) {
     }
 }
 void Client::disconnected() {
+    connectionFailed = wanted; lastLatency = -1;
     authorized = false; refresh.stop(); sendTimer.stop(); outbound.clear();
     auto old = std::move(pending); pending.clear();
     emit lost();

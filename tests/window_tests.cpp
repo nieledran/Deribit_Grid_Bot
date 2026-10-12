@@ -12,6 +12,30 @@ using namespace grid;
 class WindowTests : public QObject {
     Q_OBJECT
 private slots:
+    void latencyIndicatorShowsSlowConnectionAndRecovery() {
+        QTemporaryDir dir;
+        QWebSocketServer server("UI latency", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QWebSocket* peer = nullptr; QJsonValue authId;
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                if (j["method"] == "public/auth") authId = j["id"];
+                else if (j["method"] == "public/set_heartbeat")
+                    peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"id", j["id"]}, {"result", QJsonObject{}}}).toJson()));
+                // Instrument initialization stays pending; this test never starts a grid.
+            });
+        });
+        Window window(dir.filePath("latency.db"), "BTC_USDC-PERPETUAL", nullptr, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        auto* latency = window.findChild<QLabel*>("connectionLatency"); QVERIFY(latency);
+        window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake");
+        window.findChild<QPushButton*>("connect")->click(); QTRY_VERIFY(!authId.isUndefined());
+        QTRY_VERIFY_WITH_TIMEOUT(latency->text().contains("≥") && latency->styleSheet().contains("#b91c1c"), 3500);
+        peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"id", authId}, {"result", QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}}}}).toJson()));
+        QTRY_VERIFY_WITH_TIMEOUT(latency->text().contains(" ms") && !latency->text().contains("≥") && latency->styleSheet().isEmpty(), 1000);
+        peer->close(); QTRY_COMPARE(latency->text(), QString("Latency: offline"));
+        QVERIFY(latency->styleSheet().contains("#b91c1c"));
+    }
     void transitionIndicatorUsesExistingStatusRow() {
         QTemporaryDir dir; const auto path = dir.filePath("transition.db");
         Engine seed; seed.profileId = "transitionui"; seed.spec = {Scale / 10, Scale / 10000, {}};
@@ -20,6 +44,11 @@ private slots:
         seed.rebuildFloor = seed.nextCycle;
         { Store db(path); db.save(seed); }
         Window window(path, "BTC_USDC-PERPETUAL"); window.show();
+        auto* latency = window.findChild<QLabel*>("connectionLatency");
+        QVERIFY(latency); QCOMPARE(latency->text(), QString("Latency: — ms"));
+        QVERIFY(latency->styleSheet().isEmpty());
+        QVERIFY(latency->x() < window.findChild<QPushButton*>("deleteProfile")->x());
+        QCOMPARE(latency->y(), window.findChild<QPushButton*>("deleteProfile")->y());
         auto* summary = window.findChild<QLabel*>("gridSummary"); auto* button = window.findChild<QPushButton*>("applySettings");
         QVERIFY(summary && button); QVERIFY(summary->text().contains("transition: Long 8/14"));
         QVERIFY(button->property("transitionActive").toBool());

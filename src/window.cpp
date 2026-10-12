@@ -154,7 +154,10 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     resetButton->setToolTip("Cancel all bot orders first. Clears saved cycles/orders and tracked inventory, keeping settings and session counters. Exchange position stays open.");
     historyButtons->addWidget(clearLogButton); historyButtons->addWidget(resetButton); historyButtons->addStretch(); layout->addLayout(historyButtons);
     journal = new QPlainTextEdit; journal->setReadOnly(true); journal->setMaximumBlockCount(1000); journal->setMaximumHeight(155); layout->addWidget(journal);
-    auto* footer = new QHBoxLayout; footer->addStretch();
+    auto* footer = new QHBoxLayout;
+    latencyLabel = new QLabel; latencyLabel->setObjectName("connectionLatency");
+    latencyLabel->setToolTip("Exchange response time in milliseconds. Red means disconnected, a response or connection taking at least 2 seconds, or no incoming data for 15 seconds.");
+    footer->addWidget(latencyLabel); footer->addStretch();
     deleteProfileButton = new QPushButton("Delete current profile"); deleteProfileButton->setObjectName("deleteProfile");
     auto deletePalette = deleteProfileButton->palette(); deletePalette.setColor(QPalette::ButtonText, QColor("#b91c1c"));
     deletePalette.setColor(QPalette::Button, QColor("#fee2e2")); deleteProfileButton->setPalette(deletePalette);
@@ -196,6 +199,7 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     });
     connect(instrumentBox, &QComboBox::currentTextChanged, this, [this] { render(); });
     pumpTimer.setInterval(400); connect(&pumpTimer, &QTimer::timeout, this, &Window::pump); pumpTimer.start();
+    connect(&pumpTimer, &QTimer::timeout, this, &Window::updateLatency);
     readTimer.setInterval(5000); connect(&readTimer, &QTimer::timeout, this, &Window::refreshAccount); readTimer.start();
     log("Ready. Set ranges and budgets (0 disables a side), then connect. No market or stop-loss orders."); render();
 }
@@ -731,8 +735,19 @@ void Window::pump() {
         render();
     } catch (const std::exception& e) { fail(QString::fromUtf8(e.what())); }
 }
+void Window::updateLatency() {
+    const auto status = client.connectionStatus();
+    using State = Client::ConnectionStatus::State;
+    QString label = "Latency: — ms";
+    if (status.state == State::Offline) label = "Latency: offline";
+    else if (status.state == State::Connecting) label = QString("Connecting: %1 ms").arg(status.milliseconds);
+    else if (status.milliseconds >= 0) label = QString("Latency: %1%2 ms").arg(status.waiting ? "≥ " : "").arg(status.milliseconds);
+    latencyLabel->setText(label);
+    latencyLabel->setStyleSheet(status.slow || status.state == State::Offline ? "color:#b91c1c" : "");
+}
 void Window::render() {
     if (!summaryLabel) return;
+    updateLatency();
     // Instrument and environment belong to the selected profile and cannot change in place.
     instrumentBox->setEnabled(false); environmentBox->setEnabled(false);
     connectButton->setEnabled(!busy && !storageFailed && !closing); connectButton->setText(client.authenticated() ? "Reconnect / Reconcile" : "Connect");

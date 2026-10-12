@@ -36,6 +36,7 @@ private:
     QTableWidget *settings = nullptr, *cyclesTable = nullptr, *ordersTable = nullptr, *previewTable = nullptr;
     QPlainTextEdit* journal = nullptr;
     QLabel *connectionLabel = nullptr, *summaryLabel = nullptr, *statsLabel = nullptr;
+    QLabel* latencyLabel = nullptr;
     QCheckBox* previewBox = nullptr;
     QPushButton *connectButton = nullptr, *startButton = nullptr, *pauseButton = nullptr, *applyButton = nullptr, *cancelButton = nullptr, *resetButton = nullptr, *deleteProfileButton = nullptr;
     bool ready = false, syncing = false, busy = false, closing = false, closeAllowed = false;
@@ -67,6 +68,7 @@ private:
     void log(const QString& text);
     void fail(const QString& text);
     void render();
+    void updateLatency();
     void renderPreview(const grid::Preview& view);
     void pump();
     void submit(const grid::Action& action);
