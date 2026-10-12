@@ -106,13 +106,62 @@ void rebuildAndOldSlots() {
     e.requestRebuild(next);
     auto fresh = requireAction(e, Mutation::Create, Role::Entry); ack(e, fresh);
     check(e.cycles()[0].retired && e.cycles()[0].take == take.price, "Old take must stay fixed");
-    check(e.lattice.size() == 3 && e.occupiedSlots(Side::Short) == 2, "Old cycle consumes one of new slots");
+    check(e.lattice.size() == 2 && e.occupiedSlots(Side::Short) == 2, "Old cycle reduces the transition denominator");
     fresh = requireAction(e, Mutation::Create, Role::Entry); ack(e, fresh);
     check(!e.nextAction() && e.occupiedSlots(Side::Short) == 3, "No extra slots while old take is open");
     e.apply(snapshot(*e.order(take.label), take.total, true, 10));
+    auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); ack(e, cancel);
     fresh = requireAction(e, Mutation::Create, Role::Entry);
-    check(fresh.price == e.lattice.back().entry, "Old take frees a current lattice level");
+    check(e.lattice.size() == 3 && fresh.price == e.lattice.front().entry, "Old take recalculates the step over the full range");
     check(e.used(Side::Short) <= next.shorts.budget, "New and old allocations respect the cap");
+}
+void rangeTransition() {
+    for (const auto side : {Side::Long, Side::Short}) {
+        Engine e; e.profileId = "transition"; e.spec = {p(0.1), p(0.0001), {}};
+        auto& band = side == Side::Long ? e.config.longs : e.config.shorts;
+        band = {p(82500), p(84500), 850 * Dollars, 14};
+        e.quote(p(83500), p(83500));
+        for (int i = 0; i < 7; ++i) {
+            const Int entry = side == Side::Long ? p(83700 + i) : p(83300 - i);
+            const Int take = side == Side::Long ? entry + p(50) : entry - p(50);
+            e.importCycle({e.nextCycle++, 0, side, entry, take, 2, 2, true});
+        }
+        std::vector<Action> oldTakes;
+        for (int i = 0; i < 7; ++i) { auto a = requireAction(e, Mutation::Create, Role::Take); ack(e, a); oldTakes.push_back(a); }
+        e.requestRebuild(e.config); completePause(e);
+        check(e.transitionSlots(side) == 7 && e.lattice.size() == 7 && e.transitioning(side), "Seven free slots use seven intervals");
+        const Int endpoint = side == Side::Long ? band.low : band.high;
+        check(e.lattice.back().entry == endpoint, "Transition immediately reaches the new endpoint");
+        const auto generation = e.generation;
+        const auto levels = e.lattice;
+        const auto current = e.cycles()[7];
+        Order currentEntry;
+        for (const auto& o : e.orders()) if (o.cycle == current.id && o.role == Role::Entry) currentEntry = o;
+        e.apply(snapshot(currentEntry, 2, false, 100));
+        auto newTake = requireAction(e, Mutation::Create, Role::Take); ack(e, newTake);
+        check(!e.nextAction() && e.generation == generation && e.transitionSlots(side) == 7, "New entry fill does not resize the transition");
+        e.apply(snapshot(*e.order(newTake.label), 1, false, 101)); completePause(e);
+        check(e.generation == generation && e.lattice.front().entry == levels.front().entry, "Partial new take uses ordinary reentry without resizing");
+        e.apply(snapshot(*e.order(oldTakes[0].label), 1, false, 102)); completePause(e);
+        check(e.generation == generation && e.transitionSlots(side) == 7, "Partial old take releases money but not a slot");
+        for (int i = 0; i < 7; ++i) {
+            // Move toward the entries by less than a step, so only the old take triggers a resize.
+            const Int mid = p(side == Side::Long ? 83499 - i : 83501 + i); e.quote(mid, mid);
+            e.apply(snapshot(*e.order(oldTakes[i].label), 2, true, 110 + i)); completePause(e);
+            check(e.transitionSlots(side) == 8 + i && e.lattice.size() == size_t(8 + i), "Each closed old cycle adds one interval");
+            check(e.lattice.back().entry == endpoint, "Every transition step covers the endpoint");
+            const auto* kept = e.cycle(current.id);
+            check(!kept->retired && kept->take == current.take && kept->entry == current.entry, "New positioned cycle keeps its take and repeat rules");
+            check(e.occupiedSlots(side) == 14 && e.used(side) <= band.budget, "Transition preserves slot and budget caps");
+            bool liveEndpoint = false;
+            for (const auto& o : e.orders()) if (o.role == Role::Entry && o.live() && o.price == endpoint) liveEndpoint = true;
+            check(liveEndpoint, "A resting entry reaches the endpoint despite positioned new cycles");
+        }
+        check(!e.transitioning(side), "Transition ends after all original old cycles close");
+        const auto finalGeneration = e.generation;
+        e.apply(snapshot(*e.order(newTake.label), 2, true, 200)); completePause(e);
+        check(e.generation == finalGeneration && e.lattice.size() == 14, "New take after transition keeps the ordinary grid step");
+    }
 }
 void limitsAndUncertainty() {
     auto e = setup(1); auto entry = requireAction(e, Mutation::Create, Role::Entry); ack(e, entry, entry.total, true);
@@ -323,7 +372,7 @@ void manualTakesKeepPriority() {
 }
 int main() {
     try {
-        lateFillAfterRestoringSameCycle(); malformedIdentityDoesNotMutateInventory(); lateFillAfterGridCommit(); autoRebuildProtectsRacedFills(); exactArithmeticAndSlots(); pricesAndCaps(); partialAndDuplicate(); partialTakeReentry(); rebuildAndOldSlots();
+        rangeTransition(); lateFillAfterRestoringSameCycle(); malformedIdentityDoesNotMutateInventory(); lateFillAfterGridCommit(); autoRebuildProtectsRacedFills(); exactArithmeticAndSlots(); pricesAndCaps(); partialAndDuplicate(); partialTakeReentry(); rebuildAndOldSlots();
         limitsAndUncertainty(); switchingAndConflicts(); denseAndGap(); takePriorityAndSmallerSlotLimit(); simultaneousGridsSurviveFastQuotes(); manualPositionRecovery(); manualTakesKeepPriority();
         std::cout << "PASS: " << checks << " grid checks\n"; return EXIT_SUCCESS;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return EXIT_FAILURE; }

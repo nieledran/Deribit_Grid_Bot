@@ -12,6 +12,25 @@ using namespace grid;
 class WindowTests : public QObject {
     Q_OBJECT
 private slots:
+    void transitionIndicatorUsesExistingStatusRow() {
+        QTemporaryDir dir; const auto path = dir.filePath("transition.db");
+        Engine seed; seed.profileId = "transitionui"; seed.spec = {Scale / 10, Scale / 10000, {}};
+        seed.config.longs = {82500 * Scale, 84500 * Scale, 850 * Dollars, 14};
+        for (int i = 0; i < 6; ++i) seed.importCycle({seed.nextCycle++, 0, Side::Long, (83700 + i) * Scale, (83800 + i) * Scale, 2, 2, true});
+        seed.rebuildFloor = seed.nextCycle;
+        { Store db(path); db.save(seed); }
+        Window window(path, "BTC_USDC-PERPETUAL"); window.show();
+        auto* summary = window.findChild<QLabel*>("gridSummary"); auto* button = window.findChild<QPushButton*>("applySettings");
+        QVERIFY(summary && button); QVERIFY(summary->text().contains("transition: Long 8/14"));
+        QVERIFY(button->property("transitionActive").toBool());
+        QCOMPARE(button->palette().color(QPalette::Button), QColor("#dbeafe"));
+        QCOMPARE(button->text(), QString("Apply settings / Rebuild"));
+        QTest::qWait(150);
+        QVERIFY(window.grab().save("rebuild-transition.png"));
+        Window ordinary(dir.filePath("ordinary.db"), "BTC_USDC-PERPETUAL");
+        QVERIFY(!ordinary.findChild<QPushButton*>("applySettings")->property("transitionActive").toBool());
+        QVERIFY(!ordinary.findChild<QLabel*>("gridSummary")->text().contains("transition:"));
+    }
     void missingCreateRecovery_data() {
         QTest::addColumn<QString>("scenario");
         for (const auto& name : {"absent", "delayed-open", "historical-filled", "historical-cancelled", "ambiguous", "history-error", "position-mismatch"})

@@ -9,7 +9,11 @@
             "includePath": [
                 "${workspaceFolder}/src",
                 "${workspaceFolder}/.deps/boost_1_89_0",
-                "${workspaceFolder}/.deps/Qt/6.8.3/msvc2022_64/include/**"
+                "${workspaceFolder}/.deps/Qt/6.8.3/msvc2022_64/include/**",
+                "${workspaceFolder}/build/app/storage_tests_autogen/include_Release",
+                "${workspaceFolder}/build/app/client_tests_autogen/include_Release",
+                "${workspaceFolder}/build/app/controller_tests_autogen/include_Release",
+                "${workspaceFolder}/build/app/window_tests_autogen/include_Release"
             ]
         }
     ],

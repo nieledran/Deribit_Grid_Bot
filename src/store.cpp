@@ -49,7 +49,7 @@ void validateNativeIntegers(const QJsonValue& value) {
     if (!value.isObject()) return;
     static const std::set<QString> integers{"version", "low", "high", "budget", "levels", "id", "generation", "side", "entry", "take", "capacity", "held",
         "cycle", "role", "price", "total", "filled", "exchangeTime", "status", "mutation", "desiredTotal", "priceTick", "quantityStep", "tick",
-        "nextCycle", "nextOrder", "historyFloor", "active", "externalPosition"};
+        "nextCycle", "nextOrder", "historyFloor", "rebuildFloor", "active", "externalPosition"};
     const auto object = value.toObject();
     for (auto i = object.begin(); i != object.end(); ++i) {
         if (integers.contains(i.key()) && !(i.key() == "levels" && i.value().isArray()) && !i.value().isDouble()) throw std::runtime_error("Version 4 requires JSON integers");
@@ -72,6 +72,7 @@ QJsonObject encodeEngine(const Engine& e, bool records) {
         {"generation", s(e.generation)}, {"nextCycle", s(e.nextCycle)}, {"nextOrder", s(e.nextOrder)}, {"historyFloor", s(e.historyFloor)}, {"active", static_cast<int>(e.active)},
         {"running", e.running}, {"rebuilding", e.rebuilding}, {"cancelEverything", e.cancelEverything}, {"blocked", e.blocked}, {"problem", QString::fromStdString(e.problem)}};
     if (e.pendingConfig) root["pendingConfig"] = encodeConfig(*e.pendingConfig);
+    root["rebuildFloor"] = s(e.rebuildFloor);
     root["positionBlocked"] = e.positionBlocked;
     if (e.externalPosition) root["externalPosition"] = s(*e.externalPosition);
     return root;
@@ -85,12 +86,13 @@ Engine decodeEngine(const QJsonObject& o) {
     e.spec.priceTick = n(o, "priceTick"); e.spec.quantityStep = n(o, "quantityStep");
     e.generation = n(o, "generation"); e.nextCycle = n(o, "nextCycle"); e.nextOrder = n(o, "nextOrder");
     if (o.contains("historyFloor")) e.historyFloor = n(o, "historyFloor");
+    if (o.contains("rebuildFloor")) e.rebuildFloor = n(o, "rebuildFloor");
     e.active = static_cast<Side>(bounded(o, "active", 0, 2)); e.running = boolean(o, "running"); e.rebuilding = boolean(o, "rebuilding");
     e.cancelEverything = boolean(o, "cancelEverything"); e.blocked = boolean(o, "blocked"); e.problem = o["problem"].toString().toStdString();
     if (o.contains("pendingConfig")) e.pendingConfig = decodeConfig(o["pendingConfig"].toObject());
     e.positionBlocked = o.contains("positionBlocked") ? boolean(o, "positionBlocked") : false;
     if (o.contains("externalPosition")) e.externalPosition = n(o, "externalPosition");
-    if (e.historyFloor <= 0 || e.historyFloor > e.nextCycle || e.nextCycle <= 0 || e.nextOrder <= 0 || e.generation < 0 || e.spec.priceTick < 0 || e.spec.quantityStep < 0)
+    if (e.rebuildFloor <= 0 || e.rebuildFloor > e.nextCycle || e.historyFloor <= 0 || e.historyFloor > e.nextCycle || e.nextCycle <= 0 || e.nextOrder <= 0 || e.generation < 0 || e.spec.priceTick < 0 || e.spec.quantityStep < 0)
         throw std::runtime_error("Invalid stored counters/specification");
     for (const auto* key : {"cycles", "orders", "levels", "tickSteps"}) if (!o[key].isArray()) throw std::runtime_error("Invalid stored record array");
     if (e.spec.priceTick > 1000000000LL * Scale || e.spec.quantityStep > 1000000000LL * Scale) throw std::runtime_error("Stored specification overflow");

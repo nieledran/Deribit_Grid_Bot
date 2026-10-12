@@ -10,6 +10,37 @@ using namespace grid;
 class StorageTests : public QObject {
     Q_OBJECT
 private slots:
+    void transitionSurvivesInterruptedCancellation() {
+        Engine e; e.profileId = "transition"; e.spec = {Scale / 10, Scale / 10000, {}};
+        e.config.longs = {82500 * Scale, 84500 * Scale, 850 * Dollars, 3};
+        e.importCycle({e.nextCycle++, 0, Side::Long, 83700 * Scale, 83800 * Scale, 2, 2, true});
+        e.quote(83500 * Scale, 83500 * Scale);
+        const auto finish = [](Engine& engine, const Action& a) {
+            const auto o = *engine.order(a.label);
+            engine.apply({o.label, o.exchangeId.empty() ? "ex-" + o.label : o.exchangeId, o.total, o.filled, o.exchangeTime + 1, o.price, a.kind == Mutation::Cancel});
+            engine.resolved(a.label);
+        };
+        auto take = e.nextAction(); QVERIFY(take && take->role == Role::Take); finish(e, *take);
+        e.requestRebuild(e.config);
+        while (const auto a = e.nextAction()) finish(e, *a);
+        QCOMPARE(e.lattice.size(), size_t(2)); QCOMPARE(e.rebuildFloor, Int(2));
+        auto restored = decodeEngine(encodeEngine(e));
+        restored.quote(83500 * Scale, 83500 * Scale);
+        QCOMPARE(restored.transitionSlots(Side::Long), 2); QVERIFY(restored.transitioning(Side::Long));
+        const auto old = *restored.order(take->label);
+        restored.apply({old.label, old.exchangeId, old.total, old.total, 20, old.price, true});
+        auto cancel = restored.nextAction(); QVERIFY(cancel && cancel->kind == Mutation::Cancel); finish(restored, *cancel);
+        // Restart between cancellation replies, with no duplicate list of old cycles saved.
+        restored = decodeEngine(encodeEngine(restored));
+        restored.quote(83490 * Scale, 83490 * Scale);
+        while (const auto a = restored.nextAction()) finish(restored, *a);
+        QCOMPARE(restored.rebuildFloor, Int(2)); QCOMPARE(restored.lattice.size(), size_t(3));
+        QCOMPARE(restored.lattice.back().entry, 82500 * Scale); QVERIFY(!restored.transitioning(Side::Long));
+        // Existing profiles have no cohort marker and remain readable.
+        auto legacy = encodeEngine(restored); legacy.remove("rebuildFloor"); QCOMPARE(decodeEngine(legacy).rebuildFloor, Int(1));
+        auto invalid = encodeEngine(restored); invalid["rebuildFloor"] = restored.nextCycle + 1;
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(invalid));
+    }
     void constructorFailureReleasesConnection() {
         const auto before = QSqlDatabase::connectionNames();
         QTemporaryDir dir;

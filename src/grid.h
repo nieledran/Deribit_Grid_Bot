@@ -82,6 +82,7 @@ public:
     std::vector<Level> lattice;
     Side active = Side::None;
     Int generation = 0, nextCycle = 1, nextOrder = 1, historyFloor = 1;
+    Int rebuildFloor = 1; // Cycles below this ID belong to the last explicit rebuild.
     Int market = 0, bid = 0, ask = 0;
     bool running = false, rebuilding = false, cancelEverything = false;
     bool blocked = false;
@@ -113,6 +114,8 @@ public:
     Int used(Side side) const;
     int occupiedSlots(Side side) const;
     int availableSlots(Side side) const;
+    int transitionSlots(Side side) const;
+    bool transitioning(Side side) const;
     const Cycle* cycle(Int id) const;
     const Order* order(const std::string& label) const;
     const Order* orderByExchangeId(const std::string& id) const;
@@ -132,9 +135,12 @@ private:
     std::array<Totals, 2> totals_{};
     std::uint64_t revision_ = 0;
     Side movingSide_ = Side::None;
+    bool transitionResize_ = false;
     Int extreme_ = 0, movingAnchor_ = 0;
     std::vector<Level> movingLevels_;
     bool retainedLevel(const Cycle& cycle) const;
+    Engine movePreview() const;
+    bool prepareMove(Side side, bool resize);
     std::array<Int, 2> anchors_{};
     void refreshCycle(Int id);
     void refreshOrder(size_t index);

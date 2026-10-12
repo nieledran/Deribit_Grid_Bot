@@ -12,6 +12,8 @@
 #include <QJsonArray>
 #include <QMessageBox>
 #include <QSpinBox>
+#include <QStylePainter>
+#include <QStyleOptionButton>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QUuid>
@@ -55,6 +57,35 @@ void setupTable(QTableWidget* table, const QStringList& headers) {
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); table->verticalHeader()->hide();
     table->setEditTriggers(QAbstractItemView::NoEditTriggers); table->setAlternatingRowColors(true);
 }
+class RebuildButton : public QPushButton {
+    QTimer stripes;
+    QPalette normal;
+    int offset = 0;
+public:
+    explicit RebuildButton(const QString& label) : QPushButton(label), normal(palette()) {
+        stripes.setInterval(100);
+        connect(&stripes, &QTimer::timeout, this, [this] { offset = (offset + 1) % 24; update(); });
+    }
+    void setTransition(bool active) {
+        if (active == stripes.isActive()) return;
+        if (active) {
+            auto blue = normal; blue.setColor(QPalette::ButtonText, QColor("#1d4ed8"));
+            blue.setColor(QPalette::Button, QColor("#dbeafe")); setPalette(blue); stripes.start();
+        } else { stripes.stop(); setPalette(normal); }
+        setProperty("transitionActive", active); update();
+    }
+protected:
+    void paintEvent(QPaintEvent* event) override {
+        if (!stripes.isActive()) { QPushButton::paintEvent(event); return; }
+        QStylePainter painter(this); QStyleOptionButton option; initStyleOption(&option);
+        painter.drawControl(QStyle::CE_PushButtonBevel, option);
+        painter.save(); painter.setClipRect(rect().adjusted(3, 3, -3, -3));
+        painter.setPen(Qt::NoPen); painter.setBrush(QColor(37, 99, 235, 18));
+        for (int x = -height() - 24 + offset; x < width(); x += 24)
+            painter.drawPolygon(QPolygon{QPoint(x, height()), QPoint(x + 10, height()), QPoint(x + height() + 10, 0), QPoint(x + height(), 0)});
+        painter.restore(); painter.drawControl(QStyle::CE_PushButtonLabel, option);
+    }
+};
 }
 Window::Window(const QString& profile, const QString& initialInstrument, QWidget* parent, const QUrl& endpoint, bool initialProduction) : QMainWindow(parent), client(this), testEndpoint(endpoint) {
     profilePath = QFileInfo(profile).absoluteFilePath();
@@ -98,7 +129,8 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     auto* buttons = new QHBoxLayout;
     startButton = new QPushButton("Start / Resume"); pauseButton = new QPushButton("Pause (keep takes)");
     startButton->setObjectName("start"); pauseButton->setObjectName("pause");
-    applyButton = new QPushButton("Apply settings / Rebuild"); cancelButton = new QPushButton("Cancel all bot orders");
+    applyButton = new RebuildButton("Apply settings / Rebuild"); applyButton->setObjectName("applySettings");
+    cancelButton = new QPushButton("Cancel all bot orders");
     cancelButton->setObjectName("cancelBotOrders");
     previewBox = new QCheckBox("Preview pending settings");
     auto* resetStatsButton = new QPushButton("Reset stats"); resetStatsButton->setObjectName("resetStats");
@@ -106,7 +138,7 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     connect(resetStatsButton, &QPushButton::clicked, this, &Window::resetStats);
     buttons->addWidget(startButton); buttons->addWidget(pauseButton); buttons->addWidget(applyButton); buttons->addWidget(cancelButton); buttons->addWidget(previewBox); buttons->addStretch(); buttons->addWidget(resetStatsButton); layout->addLayout(buttons);
     auto* statusRow = new QHBoxLayout;
-    summaryLabel = new QLabel; summaryLabel->setWordWrap(true); statusRow->addWidget(summaryLabel, 1);
+    summaryLabel = new QLabel; summaryLabel->setObjectName("gridSummary"); summaryLabel->setWordWrap(true); statusRow->addWidget(summaryLabel, 1);
     statsLabel = new QLabel; statsLabel->setObjectName("sessionStats");
     statsLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     statsLabel->setToolTip("P&L is gross, using grid entry/take prices, excluding fees and funding. Fees are actual USDC fees for both entries and takes since the first connection or last stats reset; negative fees are rebates. Incomplete means some fees are unavailable. Each fully executed take order counts once. Counters reset when this window closes or Reset stats is clicked.");
@@ -712,7 +744,15 @@ void Window::render() {
     idBox->setEnabled(!client.authenticated()); secretBox->setEnabled(!client.authenticated());
     connectionLabel->setText(syncing ? "Reconciling" : ready ? "Connected" : client.authenticated() ? "Needs reconciliation" : "Disconnected");
     environmentBox->setStyleSheet(environmentBox->currentIndex() ? "color:#b91c1c;font-weight:bold" : "");
-    QString mode = engine.positionBlocked ? "Position mismatch" : engine.cancelEverything ? "Cancelling all" : engine.blocked ? "Blocked" : engine.rebuilding ? "Rebuilding" : engine.running ? "Running" : "Paused";
+    QString mode = engine.positionBlocked ? "Position mismatch" : engine.cancelEverything ? "Cancelling all" : engine.blocked ? "Blocked" : engine.rebuilding && !engine.running ? "Rebuilding" : engine.running ? "Running" : "Paused";
+    QStringList transitions;
+    for (const auto side : {Side::Long, Side::Short}) if (engine.transitioning(side)) {
+        const auto& range = side == Side::Long ? engine.config.longs : engine.config.shorts;
+        transitions.append(QString("%1 %2/%3").arg(text(sideName(side))).arg(engine.transitionSlots(side)).arg(range.levels));
+    }
+    if (!transitions.isEmpty()) mode += " [transition: " + transitions.join(", ") + "]";
+    static_cast<RebuildButton*>(applyButton)->setTransition(!transitions.isEmpty());
+    applyButton->setToolTip(transitions.isEmpty() ? "" : "Old positions keep their takes. Each fully closed old cycle updates the free grid at the current price. New fills keep the ordinary repeat rules.");
     bool feesComplete = false;
     try { feesComplete = !feesUnavailable && store->feesComplete(); } catch (const std::exception&) { feesUnavailable = true; }
     statsLabel->setText(QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC%3\nClosed trades: %4")
