@@ -8,7 +8,7 @@ class TradeController {
 public:
     struct Receipt {
         QString exchangeId;
-        grid::Int delta = 0, spread = 0;
+        grid::Int delta = 0, spread = 0, previousFilled = 0;
         bool take = false, closed = false;
     };
     struct Notification { QJsonObject json; std::string label; bool own = false; };

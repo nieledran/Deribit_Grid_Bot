@@ -53,6 +53,7 @@ private:
     qint64 feesSince = 0;
     quint64 statsRevision = 0;
     QSet<QString> feeRequests;
+    QHash<QString, grid::Int> recoveredFeeSkips;
     QString accountId;
     QString profilePath;
     QUrl testEndpoint;
@@ -85,7 +86,7 @@ private:
     void receiveOrder(const QJsonObject& order, bool resolve = false, bool persist = true, const std::string* label = nullptr);
     void receiveOrders(const QJsonArray& orders);
     void receiveForeignOrder(const QJsonObject& order);
-    void receiveTrades(const QJsonArray& trades);
+    void receiveTrades(const QJsonArray& trades, grid::Int skipLots = -1);
     void refreshFees(const QString& orderId);
     void readMarket(const QJsonObject& ticker);
     void refreshAccount();

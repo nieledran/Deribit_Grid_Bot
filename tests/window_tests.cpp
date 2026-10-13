@@ -515,6 +515,95 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(([&] { Store db(path); Engine cleared; db.load(cleared); return cleared.cycles().empty() && !cleared.positionBlocked; })(), 5000);
         QCOMPARE(tradingCalls, 0); window.close();
     }
+    void offlineTakesCountOnlyMissedFills_data() {
+        QTest::addColumn<bool>("isLong"); QTest::addColumn<bool>("full");
+        QTest::newRow("long-partial") << true << false;
+        QTest::newRow("long-full") << true << true;
+        QTest::newRow("short-partial") << false << false;
+        QTest::newRow("short-full") << false << true;
+    }
+    void offlineTakesCountOnlyMissedFills() {
+        QFETCH(bool, isLong); QFETCH(bool, full);
+        QTemporaryDir dir; const auto path = dir.filePath("overnight.db");
+        Engine seed; seed.profileId = "overnight"; seed.spec = {Scale / 10, Scale / 10000, {}}; seed.externalPosition = 0;
+        seed.nextCycle = 2; seed.nextOrder = 3;
+        seed.importCycle({1, 1, isLong ? Side::Long : Side::Short, (isLong ? 100 : 110) * Scale,
+            (isLong ? 110 : 100) * Scale, 4, 3, false});
+        Order entry; entry.label = "dg_overnight_1_e_1"; entry.exchangeId = "entry"; entry.cycle = 1;
+        entry.price = seed.cycles()[0].entry; entry.total = entry.filled = entry.desiredTotal = 4; entry.status = Status::Terminal;
+        seed.importOrder(entry);
+        Order take = entry; take.label = "dg_overnight_1_t_2"; take.exchangeId = "take"; take.role = Role::Take;
+        take.price = seed.cycles()[0].take; take.filled = 1; take.status = Status::Open; seed.importOrder(take);
+        { Store db(path); db.save(seed); }
+        QJsonObject current{{"instrument_name", "BTC_USDC-PERPETUAL"}, {"order_type", "limit"},
+            {"direction", isLong ? "sell" : "buy"}, {"label", QString::fromStdString(take.label)}, {"order_id", "take"},
+            {"price", isLong ? 110.0 : 100.0}, {"amount", 0.0004}, {"filled_amount", full ? 0.0004 : 0.0003},
+            {"order_state", full ? "filled" : "open"}, {"last_update_timestamp", 10}};
+        const auto trade = [](const QString& id, double amount, double fee) {
+            return QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"}, {"order_id", "take"}, {"trade_id", id},
+                {"timestamp", 2}, {"amount", amount}, {"fee", fee}, {"fee_currency", "USDC"}};
+        };
+        QJsonArray trades{trade("already-counted", 0.0001, 1000), trade("overnight-a", 0.0002, 0.02)};
+        if (full) trades.append(trade("overnight-b", 0.0001, -0.001));
+        bool feesAvailable = false; int tradingCalls = 0, feeReads = 0; QWebSocket* peer = nullptr;
+        QWebSocketServer server("Offline takes", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* socket = server.nextPendingConnection(); socket->setParent(&server); peer = socket;
+            connect(socket, &QWebSocket::textMessageReceived, this, [&, socket](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object(); const auto method = j["method"].toString();
+                QJsonValue result = QJsonObject{};
+                if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"},
+                    {"base_currency", "BTC"}, {"settlement_currency", "USDC"}, {"kind", "future"}, {"settlement_period", "perpetual"},
+                    {"state", "open"}, {"tick_size", 0.1}, {"min_trade_amount", 0.0001}, {"contract_size", 0.0001}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", 7654321}};
+                else if (method == "public/ticker") result = QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"}, {"best_bid_price", 104.9}, {"best_ask_price", 105.1}};
+                else if (method == "private/get_position") result = QJsonObject{{"size_currency", (isLong ? 1 : -1) * (0.0004 - current["filled_amount"].toDouble())}};
+                else if (method == "private/get_open_orders_by_instrument") result = current["order_state"] == "open" ? QJsonArray{current} : QJsonArray{};
+                else if (method == "private/get_order_state") result = current;
+                else if (method == "private/get_user_trades_by_order") {
+                    ++feeReads; QJsonArray history;
+                    for (const auto& value : trades) {
+                        auto t = value.toObject(); if (!feesAvailable) t.remove("fee"); history.append(t);
+                    }
+                    result = history;
+                } else if (method == "private/buy" || method == "private/sell" || method == "private/edit" || method == "private/cancel") ++tradingCalls;
+                socket->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", j["id"]}, {"result", result}}).toJson()));
+            });
+        });
+        const auto endpoint = QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort()));
+        const QString zero = "Approx. P&L: 0.0000 USDC\nFees (entry + take): 0.0000 USDC\nClosed trades: 0";
+        const auto connectWindow = [](Window& window) {
+            window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake");
+            window.findChild<QPushButton*>("connect")->click();
+        };
+        {
+            Window window(path, "BTC_USDC-PERPETUAL", nullptr, endpoint); connectWindow(window);
+            auto* stats = window.findChild<QLabel*>("sessionStats"); QVERIFY(stats);
+            const QString prefix = QString("Approx. P&L: %1 USDC\nFees (entry + take): ").arg(full ? "0.0030" : "0.0020");
+            const QString suffix = QString("\nClosed trades: %1").arg(full ? 1 : 0);
+            QTRY_COMPARE_WITH_TIMEOUT(stats->text(), prefix + "0.0000 USDC (incomplete)" + suffix, 5000);
+            QTRY_VERIFY(feeReads > 0);
+            { Store db(path); Engine restored; QVERIFY(db.load(restored)); QCOMPARE(restored.cycles()[0].held, full ? Int(0) : Int(1)); }
+            feesAvailable = true; window.findChild<QPushButton*>("connect")->click();
+            const QString expected = prefix + (full ? "0.0190" : "0.0200") + " USDC" + suffix;
+            QTRY_COMPARE_WITH_TIMEOUT(stats->text(), expected, 5000);
+            peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"method", "subscription"}, {"params", QJsonObject{
+                {"channel", "user.changes.BTC_USDC-PERPETUAL.raw"}, {"data", QJsonObject{{"orders", QJsonArray{current}}, {"trades", trades}}}}}}).toJson()));
+            QTest::qWait(350); QCOMPARE(stats->text(), expected);
+            window.findChild<QPushButton*>("resetStats")->click(); QCOMPARE(stats->text(), zero);
+            window.findChild<QPushButton*>("connect")->click();
+            QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text(), QString("Connected"), 5000);
+            QCOMPARE(stats->text(), zero);
+            window.close();
+        }
+        {
+            Window restarted(path, "BTC_USDC-PERPETUAL", nullptr, endpoint); connectWindow(restarted);
+            QTRY_COMPARE_WITH_TIMEOUT(restarted.findChild<QLabel*>("connectionStatus")->text(), QString("Connected"), 5000);
+            QCOMPARE(restarted.findChild<QLabel*>("sessionStats")->text(), zero);
+        }
+        QCOMPARE(tradingCalls, 0);
+    }
     void pauseProtectsAFillRacingCancellation_data() {
         QTest::addColumn<bool>("recover");
         QTest::addColumn<bool>("isLong");
@@ -553,7 +642,7 @@ private slots:
             entry = QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"}, {"order_type", "limit"}, {"order_state", "open"}, {"direction", isLong ? "buy" : "sell"},
                 {"label", QString::fromStdString(o.label)}, {"order_id", "entry-1"}, {"price", static_cast<double>(o.price) / Scale},
                 {"amount", static_cast<double>(o.total) / 10000}, {"filled_amount", 0.0003}, {"last_update_timestamp", 1}};
-            auto historical = trade("entry-1", "old-entry", 0.0003, 123.0); historical["timestamp"] = 1; entryFees.append(historical);
+            auto historical = trade("entry-1", "old-entry", 0.0003, 0.01); historical["timestamp"] = 1; entryFees.append(historical);
         }
         const auto response = [](QWebSocket* socket, qint64 id, const QJsonValue& result) {
             socket->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"result", result}}).toJson()));
@@ -605,7 +694,7 @@ private slots:
         QCOMPARE(takes, 1); QCOMPARE(entries, recover ? 0 : 1);
         auto* stats = window.findChild<QLabel*>("sessionStats"); QVERIFY(stats);
         QVERIFY(!window.findChild<QPushButton*>("resetHistory")->isEnabled());
-        const QString entryCost = recover ? "0.0030" : "0.0130";
+        const QString entryCost = "0.0130";
         QTRY_COMPARE(stats->text(), QString("Approx. P&L: 0.0000 USDC\nFees (entry + take): %1 USDC\nClosed trades: 0").arg(entryCost));
         const auto publish = [&](const QJsonObject& order, const QJsonArray& trades = QJsonArray{}) {
             const QJsonObject data{{"orders", order.isEmpty() ? QJsonArray{} : QJsonArray{order}}, {"trades", trades}};
@@ -619,7 +708,7 @@ private slots:
         takeFees.append(trade("take-1", "take-a", 0.0001, -0.001));
         const auto partial = take; publish(partial, takeFees); publish(partial, takeFees);
         const QString partialPnl = isLong ? "0.4500" : "0.5400";
-        const QString partialCost = recover ? "0.0020" : "0.0120";
+        const QString partialCost = "0.0120";
         QTRY_COMPARE(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC\nClosed trades: 0").arg(partialPnl, partialCost));
         const QString zeroStats = "Approx. P&L: 0.0000 USDC\nFees (entry + take): 0.0000 USDC\nClosed trades: 0";
         if (resetStats) {
@@ -642,7 +731,7 @@ private slots:
         // A reconnect obtains the missed fee once, including for an already closed order.
         takeFees.replace(1, finalTrade);
         window.findChild<QPushButton*>("connect")->click();
-        const QString fullCost = resetStats ? "0.0060" : (recover ? "0.0080" : "0.0180");
+        const QString fullCost = resetStats ? "0.0060" : "0.0180";
         QTRY_COMPARE_WITH_TIMEOUT(stats->text(), QString("Approx. P&L: %1 USDC\nFees (entry + take): %2 USDC\nClosed trades: 1").arg(fullPnl, fullCost), 5000);
         publish({}, takeFees); publish(partial, entryFees);
         QTest::qWait(100);

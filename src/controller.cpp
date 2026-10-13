@@ -66,7 +66,7 @@ std::optional<TradeController::Receipt> TradeController::receiveOwnOrder(const Q
     const Int before = o->filled;
     const bool previouslyClosed = o->status == Status::Terminal && o->filled == o->total;
     engine.apply(update); if (resolve) engine.resolved(label);
-    Receipt result; result.exchangeId = j["order_id"].toString(); result.delta = o->filled - before; result.take = o->role == Role::Take;
+    Receipt result; result.exchangeId = j["order_id"].toString(); result.delta = o->filled - before; result.previousFilled = before; result.take = o->role == Role::Take;
     if (result.take) {
         const auto* c = engine.cycle(o->cycle); if (!c) throw std::runtime_error("Missing take cycle");
         result.spread = c->side == Side::Long ? c->take - c->entry : c->entry - c->take;
