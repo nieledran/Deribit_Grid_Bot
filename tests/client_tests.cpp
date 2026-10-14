@@ -174,8 +174,8 @@ private slots:
         QTRY_COMPARE(completed, 3);
         QVERIFY(!uncertain);
         QCOMPARE(times.size(), 3);
-        QVERIFY(times[1] - times[0] >= 220);
-        QVERIFY(times[2] - times[1] >= 220);
+        QVERIFY(times[1] - times[0] >= 470);
+        QVERIFY(times[2] - times[1] >= 470);
         client.stop();
     }
 

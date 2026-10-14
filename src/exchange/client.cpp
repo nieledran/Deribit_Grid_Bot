@@ -70,9 +70,9 @@ void Client::connectTo(
     clientId = id;
     clientSecret = secret;
     wanted = true;
-    retryMs = 1500;
+    retryMs = InitialRetryMs;
     connectionStarted = clock.elapsed();
-    mutationInterval = 250;
+    mutationInterval = MinimumTradingIntervalMs;
     endpoint = testEndpoint.isEmpty() ? QUrl(production ? "wss://www.deribit.com/ws/api/v2"
                                                         : "wss://test.deribit.com/ws/api/v2")
                                       : testEndpoint;
@@ -191,8 +191,9 @@ void Client::setTradingLimits(const QJsonObject& limits)
         matching = matching["usdc"].toObject();
     const double rate = matching["trading"].toObject()["total"].toObject()["rate"].toDouble();
     mutationInterval = std::isfinite(rate) && rate >= 1
-                           ? static_cast<int>(std::max(100.0, std::ceil(1250.0 / rate)))
-                           : 250;
+                           ? static_cast<int>(
+                                 std::max<double>(MinimumTradingIntervalMs, std::ceil(1250.0 / rate)))
+                           : MinimumTradingIntervalMs;
     emit notice(QString("Trading RPC pacing: at most %1 requests/s in this window; account limits "
                         "are shared with other clients")
             .arg(1000.0 / mutationInterval, 0, 'f', 1));
@@ -222,7 +223,7 @@ void Client::receiveAuthentication(const RpcResult& r, bool renew)
     auto auth = r.value.toObject();
     authorized = true;
     refreshToken = auth["refresh_token"].toString();
-    retryMs = 1500;
+    retryMs = InitialRetryMs;
     const int seconds = std::clamp(auth["expires_in"].toInt(3600) - 60, 10, 21600);
     refresh.start(seconds * 1000);
     if (renew)

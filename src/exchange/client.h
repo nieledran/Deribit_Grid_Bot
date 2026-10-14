@@ -49,6 +49,9 @@ signals:
     void subscription(const QString& channel, const QJsonValue& data);
 
 private:
+    static constexpr int MinimumTradingIntervalMs = 500; //limit on how fast to send orders.
+    static constexpr int InitialRetryMs = 1500;
+
     struct Pending {
         Callback callback;
         qint64 deadline;
@@ -63,10 +66,11 @@ private:
     std::deque<std::pair<qint64, QJsonObject>> outbound;
     QString clientId, clientSecret, refreshToken;
     QUrl endpoint;
-    qint64 sequence = 0, lastMessage = 0, lastSent = -100, lastMutation = -250;
+    qint64 sequence = 0, lastMessage = 0, lastSent = -100;
+    qint64 lastMutation = -MinimumTradingIntervalMs;
     qint64 lastLatency = -1, connectionStarted = 0;
-    int mutationInterval = 250;
-    int retryMs = 1500;
+    int mutationInterval = MinimumTradingIntervalMs;
+    int retryMs = InitialRetryMs;
     bool wanted = false, authorized = false;
     bool connectionFailed = false;
     void authenticate(bool renew);
