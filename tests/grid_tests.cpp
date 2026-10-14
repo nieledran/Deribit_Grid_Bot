@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <source_location>
 #include <string>
@@ -103,7 +104,8 @@ void completePause(Engine& e)
         auto a = e.nextAction();
         if (!a)
             break;
-        ack(e, *a, e.order(a->label)->filled, false, 50 + i);
+        const auto order = *e.order(a->label);
+        ack(e, *a, order.filled, false, std::max<Int>(50 + i, order.exchangeTime + 1));
     }
 }
 
@@ -568,6 +570,10 @@ void switchingAndConflicts()
     auto e = setup(2, true);
     auto entry = requireAction(e, Mutation::Create, Role::Entry);
     ack(e, entry);
+    if (entry.buy) {
+        entry = requireAction(e, Mutation::Create, Role::Entry);
+        ack(e, entry);
+    }
     e.quote(p(83999.9), p(84000.1));
     auto buy = requireAction(e, Mutation::Create, Role::Entry);
     check(buy.buy && buy.price < e.market && e.active == Side::Long,
@@ -749,7 +755,7 @@ void lateFillAfterGridCommit()
     ack(e, take);
     cancel = requireAction(e, Mutation::Cancel, Role::Entry);
     check(
-        cancel.label == replacement.label, "A late position displaces excess new opening capacity");
+        cancel.label == replacement.label, "A late position displaces the nearest opening capacity");
     ack(e, cancel, 0, true, 4);
     check(e.occupiedSlots(Side::Short) <= 2 && e.used(Side::Short) <= e.config.shorts.budget,
         "Late fill returns allocations to the configured caps");
@@ -941,6 +947,10 @@ void manualTakesKeepPriority()
     e = setup(2, true);
     auto a = requireAction(e, Mutation::Create, Role::Entry);
     ack(e, a);
+    if (a.buy) {
+        a = requireAction(e, Mutation::Create, Role::Entry);
+        ack(e, a);
+    }
     e.foreign.push_back({"late-manual-take", false, p(86000), false, true});
     auto cancel = requireAction(e, Mutation::Cancel, Role::Entry);
     check(cancel.label == a.label, "Cancel the conflicting bot entry, never the manual take");
@@ -951,9 +961,112 @@ void manualTakesKeepPriority()
         "An unpriced manual trigger is retained and blocks uncertain conflicts");
 }
 
+void ordersFollowMarketDistance()
+{
+    auto e = setup(4, true);
+    e.config.longs = {p(800), p(1000), 1000 * Dollars, 4};
+    e.config.shorts = {p(1000), p(2000), 1000 * Dollars, 4};
+    e.quote(p(1000), p(1000));
+    e.requestRebuild(e.config);
+    Int previous = 0;
+    for (int i = 0; i < 8; ++i) {
+        const auto a = requireAction(e, Mutation::Create, Role::Entry);
+        const Int distance = std::abs(a.price - e.market);
+        check(distance >= previous, "New entries across both sides run from nearest to farthest");
+        if (i < 4)
+            check(a.buy, "The four nearer long entries precede the farther short grid");
+        previous = distance;
+        ack(e, a);
+    }
+    const auto checkCancellations = [](Engine& engine) {
+        for (;;) {
+            Int nearest = std::numeric_limits<Int>::max();
+            for (const auto& o : engine.orders())
+                if (o.live() && (engine.cancelEverything || o.role == Role::Entry))
+                    nearest = std::min(nearest, std::abs(o.price - engine.market));
+            if (nearest == std::numeric_limits<Int>::max())
+                break;
+            const auto a = engine.nextAction();
+            check(a && a->kind == Mutation::Cancel &&
+                      std::abs(a->price - engine.market) == nearest,
+                "Cancel chooses the nearest live order at the current quote");
+            const auto o = *engine.order(a->label);
+            ack(engine, *a, o.filled, true, o.exchangeTime + 1);
+            engine.quote(p(995), p(995));
+        }
+    };
+    auto rebuilding = e;
+    rebuilding.requestRebuild(rebuilding.config);
+    checkCancellations(rebuilding);
+    auto mismatch = e;
+    mismatch.positionBlocked = true;
+    checkCancellations(mismatch);
+    auto conflict = e;
+    conflict.importCycle({100, 0, Side::Short, p(1900), p(1700), 1, 1, true});
+    for (const auto price : {p(1250), p(1500)}) {
+        const auto a = requireAction(conflict, Mutation::Cancel, Role::Entry);
+        check(a.price == price, "Entries crossing a take are cancelled from nearest to farthest");
+        ack(conflict, a);
+    }
+    const auto protectedTake = requireAction(conflict, Mutation::Create, Role::Take);
+    check(protectedTake.price == p(1700), "The take is protected before ordinary grid actions");
+    auto manual = e;
+    manual.foreign.push_back({"manual", false, p(2500), false, true});
+    for (const auto price : {p(1250), p(1500), p(1750), p(2000)}) {
+        const auto a = requireAction(manual, Mutation::Cancel, Role::Entry);
+        check(a.price == price, "Manual-order conflicts also cancel nearest entries first");
+        ack(manual, a);
+    }
+    e.pause();
+    checkCancellations(e);
+
+    Engine takes;
+    takes.profileId = "distance";
+    takes.spec = e.spec;
+    takes.quote(p(1000), p(1000));
+    takes.importCycle({1, 0, Side::Long, p(900), p(1400), 2, 1, true});
+    takes.importCycle({2, 0, Side::Short, p(1300), p(980), 2, 1, true});
+    takes.importCycle({3, 0, Side::Long, p(850), p(1010), 2, 2, true});
+    Order existing;
+    existing.label = "existing-take";
+    existing.exchangeId = "existing-id";
+    existing.cycle = 3;
+    existing.role = Role::Take;
+    existing.price = p(1010);
+    existing.total = 1;
+    existing.status = Status::Open;
+    takes.importOrder(existing);
+    const auto edit = requireAction(takes, Mutation::Edit, Role::Take);
+    check(edit.price == p(1010), "The nearest take edit precedes farther take creates");
+    ack(takes, edit);
+    takes.quote(p(1450), p(1450));
+    const auto farCycle = requireAction(takes, Mutation::Create, Role::Take);
+    check(farCycle.price == p(1400), "The next take uses the updated quote");
+    ack(takes, farCycle);
+    ack(takes, requireAction(takes, Mutation::Create, Role::Take));
+    takes.cancelAll();
+    checkCancellations(takes);
+
+    Engine repeat;
+    repeat.profileId = "repeat";
+    repeat.spec = e.spec;
+    repeat.config.longs = {p(800), p(1000), 1000 * Dollars, 2};
+    repeat.quote(p(1000), p(1000));
+    repeat.running = true;
+    repeat.lattice = {{p(950), p(1000), Side::Long}, {p(800), p(900), Side::Long}};
+    repeat.importCycle({1, 0, Side::Long, p(800), p(900), 1, 0, false});
+    repeat.nextCycle = 2;
+    const auto nearer = requireAction(repeat, Mutation::Create, Role::Entry);
+    check(nearer.price == p(950), "A nearer free level precedes a farther repeat entry");
+    ack(repeat, nearer);
+    const auto repeated = requireAction(repeat, Mutation::Create, Role::Entry);
+    check(repeated.price == p(800), "The existing repeat cycle is then replenished");
+}
+
 int main()
 {
     try {
+        ordersFollowMarketDistance();
         selectiveSettingsRebuild();
         selectiveRebuildRacesAndTransitions();
         selectiveRebuildDisableAndRepeatApply();

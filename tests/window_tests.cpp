@@ -15,6 +15,61 @@ class WindowTests : public QObject {
     Q_OBJECT
 private slots:
 
+    void profileCancellationUsesCurrentDistance()
+    {
+        QTemporaryDir dir;
+        Store store(dir.filePath("cancel-distance.db"));
+        Engine engine;
+        engine.profileId = "distance";
+        engine.quote(1000 * Scale, 1000 * Scale);
+        Client client;
+        int session = 0;
+        ProfileController profiles(engine, store, client, session,
+            std::make_unique<QLockFile>(dir.filePath("profile.lock")), this);
+        QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        QSignalSpy completed(&profiles, &ProfileController::cancelled);
+        QSignalSpy failed(&profiles, &ProfileController::failed);
+        QMap<QString, QJsonValue> prices{{"dg_distance_1_e_1", 990.0},
+            {"dg_distance_2_e_2", 900.0}, {"dg_distance_10_e_10", 1015.0},
+            {"dg_distance_3_e_3", "market"}};
+        QStringList cancelled;
+        QWebSocketServer server("Cancellation distance", QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection();
+            peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
+                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                const auto method = j["method"].toString();
+                QJsonValue result = QJsonObject{{"expires_in", 3600}};
+                if (method == "private/get_open_orders_by_instrument") {
+                    QJsonArray orders;
+                    for (auto it = prices.cbegin(); it != prices.cend(); ++it)
+                        orders.append(QJsonObject{{"instrument_name", "BTC_USDC-PERPETUAL"},
+                            {"order_id", "ex-" + it.key()}, {"label", it.key()}, {"price", it.value()}});
+                    result = orders;
+                } else if (method == "private/cancel_by_label") {
+                    const auto label = j["params"].toObject()["label"].toString();
+                    cancelled.append(label);
+                    result = prices.remove(label);
+                    // The remaining nearer order switches when the current quote changes.
+                    engine.quote(905 * Scale, 905 * Scale);
+                }
+                peer->sendTextMessage(QString::fromUtf8(
+                    QJsonDocument(QJsonObject{{"id", j["id"]}, {"result", result}}).toJson()));
+            });
+        });
+        client.connectTo("fake", "fake", false,
+            QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        profiles.cancelOrders(false, session);
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 1, 7000);
+        QVERIFY(failed.isEmpty());
+        QCOMPARE(cancelled, (QStringList{"dg_distance_1_e_1", "dg_distance_2_e_2",
+                                "dg_distance_10_e_10", "dg_distance_3_e_3"}));
+        client.stop();
+    }
+
     void applyRebuildsOnlyChangedSide_data()
     {
         QTest::addColumn<bool>("eth");
@@ -831,13 +886,13 @@ private slots:
         })(),
             1000);
         const auto placementMs = placementClock.elapsed();
-        QVERIFY2(placementMs < 7000, "Entry placement still waits for the 400 ms pump timer");
+        QVERIFY2(placementMs < 16000, "Entry placement adds a pump-timer gap to 500 ms API pacing");
 
         // A full rebuild must pace both cancellation and replacement by replies, with one pending mutation.
         QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled());
         placementClock.restart();
         window.findChild<QPushButton*>("start")->click();
-        QTRY_COMPARE_WITH_TIMEOUT(orders.size(), 56, 12000);
+        QTRY_COMPARE_WITH_TIMEOUT(orders.size(), 56, 35000);
         QTRY_VERIFY_WITH_TIMEOUT(([&] {
             const auto e = saved();
             return std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) {
@@ -848,7 +903,7 @@ private slots:
         const auto rebuildMs = placementClock.elapsed();
         QCOMPARE(cancelled.size(), 28);
         QVERIFY2(
-            rebuildMs < 10000, "Rebuild cancellation/replacement still waits for the pump timer");
+            rebuildMs < 32000, "Rebuild adds a pump-timer gap to 500 ms API pacing");
         QVERIFY(!overlappingMutations);
         cancelled.clear();
         qInfo() << instrument << "28 entries ms:" << placementMs

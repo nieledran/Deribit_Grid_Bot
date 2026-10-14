@@ -577,24 +577,31 @@ bool Engine::hasUnresolvedOrders() const
 
 std::optional<Action> Engine::cancelRequestedOrders()
 {
+    Order* selected = nullptr;
     for (auto& order : orders_) {
-        if (order.live() && (cancelEverything || order.role == Role::Entry))
-            return mutate(order, Mutation::Cancel);
+        if (!order.live() || (!cancelEverything && order.role != Role::Entry))
+            continue;
+        if (!selected || std::abs(order.price - market) < std::abs(selected->price - market))
+            selected = &order;
     }
+    if (selected)
+        return mutate(*selected, Mutation::Cancel);
     return {};
 }
 
 Cycle* Engine::unprotectedCycle()
 {
+    Cycle* selected = nullptr;
     for (auto& cycle : cycles_) {
         if (cycle.held <= 0)
             continue;
         const auto* take = liveOrder(cycle.id, Role::Take);
         const Int remaining = take ? take->remaining() : 0;
-        if (remaining != cycle.held)
-            return &cycle;
+        if (remaining != cycle.held &&
+            (!selected || std::abs(cycle.take - market) < std::abs(selected->take - market)))
+            selected = &cycle;
     }
-    return nullptr;
+    return selected;
 }
 
 std::optional<Action> Engine::protectCycle(Cycle& cycle)
@@ -610,11 +617,17 @@ std::optional<Action> Engine::protectCycle(Cycle& cycle)
 
 std::optional<Action> Engine::clearTakeConflict(const Cycle& cycle, bool buy)
 {
+    Order* selected = nullptr;
     for (auto& order : orders_) {
-        if (order.live() && order.role == Role::Entry && buys(order) != buy &&
-            (buy ? cycle.take >= order.price : cycle.take <= order.price))
-            return mutate(order, Mutation::Cancel);
+        const bool conflictingEntry = order.live() && order.role == Role::Entry &&
+                                      buys(order) != buy &&
+                                      (buy ? cycle.take >= order.price : cycle.take <= order.price);
+        if (conflictingEntry &&
+            (!selected || std::abs(order.price - market) < std::abs(selected->price - market)))
+            selected = &order;
     }
+    if (selected)
+        return mutate(*selected, Mutation::Cancel);
     problem = "Take is blocked by an opposite take or a manual order";
     return {};
 }
@@ -661,14 +674,20 @@ void Engine::resizeReleasedSlots()
 
 std::optional<Action> Engine::cancelRetiredEntries()
 {
+    Order* selected = nullptr;
     for (auto& order : orders_) {
         const bool liveEntry = order.live() && order.role == Role::Entry;
         if (!liveEntry)
             continue;
         const bool tradingStopped = !running || blocked;
-        if (tradingStopped || cycle(order.cycle)->retired || rebuildCancels(*cycle(order.cycle)))
-            return mutate(order, Mutation::Cancel);
+        const bool cancel =
+            tradingStopped || cycle(order.cycle)->retired || rebuildCancels(*cycle(order.cycle));
+        if (cancel &&
+            (!selected || std::abs(order.price - market) < std::abs(selected->price - market)))
+            selected = &order;
     }
+    if (selected)
+        return mutate(*selected, Mutation::Cancel);
     return {};
 }
 
@@ -687,50 +706,70 @@ std::optional<Action> Engine::nextEntryAction()
         return action;
     if (auto action = cancelConflictingEntry())
         return action;
-    if (auto action = repeatEntry())
-        return action;
-    return allocateEntry();
+    auto* cycle = repeatEntry();
+    const Level* level = nullptr;
+    for (const auto side : {Side::Short, Side::Long}) {
+        const auto* candidate = freeEntryLevel(side);
+        if (candidate &&
+            (!level || std::abs(candidate->entry - market) < std::abs(level->entry - market)))
+            level = candidate;
+    }
+    // Compare repeat entries and new slots together across both sides at the latest quote.
+    if (cycle && (!level || std::abs(cycle->entry - market) <= std::abs(level->entry - market))) {
+        const Int free = cycle->capacity - cycle->held;
+        if (auto* entry = liveOrder(cycle->id, Role::Entry))
+            return mutate(*entry, Mutation::Edit, add(entry->filled, free));
+        return create(*cycle, Role::Entry, free);
+    }
+    return level ? allocateEntry(*level) : std::nullopt;
 }
 
 std::optional<Action> Engine::retireExcessCapacity()
 {
     // A final fill can arrive after the cancellation snapshot and after a new allocation.
     // Retire opening capacity until old inventory fits the same slot and budget caps.
-    for (const auto side : {Side::Long, Side::Short}) {
-        const auto& limit = band(side);
-        for (auto i = cycles_.rbegin();
-            i != cycles_.rend() &&
-            (used(side) > limit.budget || occupiedSlots(side) > limit.levels);
-            ++i) {
-            auto& c = *i;
-            if (c.side != side || c.retired || c.capacity == c.held)
+    for (;;) {
+        Cycle* selected = nullptr;
+        for (auto& c : cycles_) {
+            const auto& limit = band(c.side);
+            const bool excess = used(c.side) > limit.budget || occupiedSlots(c.side) > limit.levels;
+            if (!excess || c.retired || c.capacity == c.held)
                 continue;
-            c.retired = true;
-            refreshCycle(c.id);
-            ++revision_;
-            if (auto* entry = liveOrder(c.id, Role::Entry))
-                return mutate(*entry, Mutation::Cancel);
+            if (!selected || std::abs(c.entry - market) < std::abs(selected->entry - market))
+                selected = &c;
         }
+        if (!selected)
+            return {};
+        selected->retired = true;
+        refreshCycle(selected->id);
+        ++revision_;
+        if (auto* entry = liveOrder(selected->id, Role::Entry))
+            return mutate(*entry, Mutation::Cancel);
     }
-
-    return {};
 }
 
 std::optional<Action> Engine::cancelConflictingEntry()
 {
     // A newly added manual order may conflict with an already resting bot entry.
+    Order* selected = nullptr;
     for (auto& order : orders_) {
-        if (order.live() && order.role == Role::Entry && entryConflict(buys(order), order.price)) {
-            problem = "Entry waits: conflict with a manual order or take";
-            return mutate(order, Mutation::Cancel);
-        }
+        const bool conflictingEntry =
+            order.live() && order.role == Role::Entry && entryConflict(buys(order), order.price);
+        if (conflictingEntry &&
+            (!selected || std::abs(order.price - market) < std::abs(selected->price - market)))
+            selected = &order;
+    }
+    if (selected) {
+        problem = "Entry waits: conflict with a manual order or take";
+        return mutate(*selected, Mutation::Cancel);
     }
     return {};
 }
 
-std::optional<Action> Engine::repeatEntry()
+Cycle* Engine::repeatEntry()
 {
     // Existing slots retain their fixed size and prices within this generation.
+    Cycle* selected = nullptr;
     for (auto& cycle : cycles_) {
         if (cycle.retired || used(cycle.side) > band(cycle.side).budget ||
             occupiedSlots(cycle.side) > band(cycle.side).levels)
@@ -740,25 +779,22 @@ std::optional<Action> Engine::repeatEntry()
         const bool buy = cycle.side == Side::Long;
         if (free <= 0 || !eligible(buy, cycle.entry) || entryConflict(buy, cycle.entry))
             continue;
-        if (!entry)
-            return create(cycle, Role::Entry, free);
-        if (entry->remaining() < free)
-            return mutate(*entry, Mutation::Edit, add(entry->filled, free));
+        if ((!entry || entry->remaining() < free) &&
+            (!selected || std::abs(cycle.entry - market) < std::abs(selected->entry - market)))
+            selected = &cycle;
     }
-    return {};
+    return selected;
 }
 
-std::optional<Action> Engine::allocateEntry()
+std::optional<Action> Engine::allocateEntry(const Level& level)
 {
-    // Alternate opening sides so both grids start filling their slots immediately.
-    const Side first =
-        occupiedSlots(Side::Short) <= occupiedSlots(Side::Long) ? Side::Short : Side::Long;
-    const Side second = first == Side::Short ? Side::Long : Side::Short;
-    for (const Side side : {first, second}) {
-        if (auto action = allocateEntryOnSide(side))
-            return action;
-    }
-    return {};
+    const auto& range = band(level.side);
+    const int freeSlots = range.levels - occupiedSlots(level.side);
+    const Int quantity = lotsFor((range.budget - used(level.side)) / freeSlots, level.entry);
+    if (nextCycle == std::numeric_limits<Int>::max())
+        throw std::runtime_error("Cycle ID overflow");
+    importCycle({nextCycle++, generation, level.side, level.entry, level.take, quantity, 0, false});
+    return create(cycles_.back(), Role::Entry, quantity);
 }
 
 int Engine::offGridAllocations(Side side) const
@@ -787,13 +823,13 @@ bool Engine::levelAllocated(const Level& level) const
     });
 }
 
-std::optional<Action> Engine::allocateEntryOnSide(Side side)
+const Level* Engine::freeEntryLevel(Side side)
 {
     const auto& range = band(side);
     const int freeSlots = range.levels - occupiedSlots(side);
     const Int freeMoney = range.budget - used(side);
     if (!range.budget || freeSlots <= 0 || freeMoney <= 0)
-        return {};
+        return nullptr;
 
     int offLattice = offGridAllocations(side);
     for (const auto& level : lattice) {
@@ -814,13 +850,11 @@ std::optional<Action> Engine::allocateEntryOnSide(Side side)
         const Int quantity = lotsFor(freeMoney / freeSlots, level.entry);
         if (!quantity) {
             problem = sideName(side) + " available budget is below the minimum quantity";
-            break;
+            continue;
         }
-        if (nextCycle == std::numeric_limits<Int>::max())
-            throw std::runtime_error("Cycle ID overflow");
-        importCycle({nextCycle++, generation, side, level.entry, level.take, quantity, 0, false});
-        return create(cycles_.back(), Role::Entry, quantity);
+        // Each side's lattice already runs from its near edge to its far edge.
+        return &level;
     }
-    return {};
+    return nullptr;
 }
 }

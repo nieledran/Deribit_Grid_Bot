@@ -228,11 +228,11 @@ private:
     std::optional<Action> nextEntryAction();
     std::optional<Action> retireExcessCapacity();
     std::optional<Action> cancelConflictingEntry();
-    std::optional<Action> repeatEntry();
-    std::optional<Action> allocateEntry();
+    Cycle* repeatEntry();
+    std::optional<Action> allocateEntry(const Level& level);
     int offGridAllocations(Side side) const;
     bool levelAllocated(const Level& level) const;
-    std::optional<Action> allocateEntryOnSide(Side side);
+    const Level* freeEntryLevel(Side side);
 };
 
 std::string sideName(Side side);

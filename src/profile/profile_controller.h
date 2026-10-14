@@ -2,6 +2,7 @@
 #include "exchange/client.h"
 #include "storage/store.h"
 #include <QLockFile>
+#include <QMap>
 #include <memory>
 
 class ProfileController : public QObject {
@@ -32,9 +33,9 @@ private:
     std::unique_ptr<QLockFile> accountLock;
     bool cancellationActive = false;
 
-    void cancelProfileLabels(const QStringList& labels, int index, bool eraseProfile);
+    void cancelProfileLabels(QMap<QString, grid::Int> labels, bool eraseProfile);
     void receiveCancellationOrders(const RpcResult& response, int epoch, bool eraseProfile);
-    QStringList cancellationLabels(const RpcResult& response) const;
+    QMap<QString, grid::Int> cancellationLabels(const RpcResult& response) const;
     void verifyProfileCancellation(bool eraseProfile, int checks);
     void readCancellationSnapshot(int epoch, bool eraseProfile, int checks);
     void receiveCancellationSnapshot(

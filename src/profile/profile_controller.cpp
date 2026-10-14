@@ -3,8 +3,8 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QJsonArray>
-#include <QSet>
 #include <QUuid>
+#include <limits>
 #include <stdexcept>
 
 using namespace grid;
@@ -66,22 +66,22 @@ void ProfileController::receiveCancellationOrders(
     if (epoch != session)
         return;
     try {
-        cancelProfileLabels(cancellationLabels(response), 0, eraseProfile);
+        cancelProfileLabels(cancellationLabels(response), eraseProfile);
     } catch (const std::exception& error) {
         finishCancellation();
         emit failed(QString::fromUtf8(error.what()) + "; profile retained", true);
     }
 }
 
-QStringList ProfileController::cancellationLabels(const RpcResult& response) const
+QMap<QString, Int> ProfileController::cancellationLabels(const RpcResult& response) const
 {
     if (!response.ok || !response.value.isArray())
         throw std::runtime_error(
             "Cannot list orders for cancellation: " + response.error.toStdString());
-    QSet<QString> labels;
+    QMap<QString, Int> labels;
     for (const auto& order : engine.orders())
         if (order.live() || order.mutation != Mutation::None)
-            labels.insert(text(order.label));
+            labels.insert(text(order.label), order.price);
     const auto prefix = "dg_" + text(engine.profileId) + "_";
     for (const auto& value : response.value.toArray()) {
         if (!value.isObject())
@@ -89,25 +89,36 @@ QStringList ProfileController::cancellationLabels(const RpcResult& response) con
         const auto order = value.toObject();
         if (order["instrument_name"].toString() != text(engine.config.instrument))
             throw std::runtime_error("Wrong instrument in cancellation snapshot");
-        if (order["label"].toString().startsWith(prefix))
-            labels.insert(order["label"].toString());
+        const auto label = order["label"].toString();
+        if (label.startsWith(prefix)) {
+            const auto price = order["price"];
+            // Retain labels without a known limit price so cancellation can still finish.
+            const Int knownPrice = price.isDouble() ? fixed(price.toDouble()) : labels.value(label);
+            labels.insert(label, knownPrice);
+        }
     }
-    QStringList ordered(labels.begin(), labels.end());
-    ordered.sort();
-
-    return ordered;
+    return labels;
 }
 
-void ProfileController::cancelProfileLabels(const QStringList& labels, int index, bool eraseProfile)
+void ProfileController::cancelProfileLabels(QMap<QString, Int> labels, bool eraseProfile)
 {
-    if (index >= labels.size()) {
+    if (labels.isEmpty()) {
         verifyProfileCancellation(eraseProfile, 0);
         return;
     }
+    auto selected = labels.begin();
+    const auto distance = [this](Int price) {
+        return price > 0 ? std::abs(price - engine.market) : std::numeric_limits<Int>::max();
+    };
+    for (auto it = labels.begin(); it != labels.end(); ++it)
+        if (distance(it.value()) < distance(selected.value()))
+            selected = it;
+    const auto label = selected.key();
+    labels.erase(selected);
     const int epoch = session;
     client.call(
-        "private/cancel_by_label", {{"currency", "USDC"}, {"label", labels[index]}},
-        [this, epoch, labels, index, eraseProfile](const RpcResult& response) {
+        "private/cancel_by_label", {{"currency", "USDC"}, {"label", label}},
+        [this, epoch, labels, eraseProfile](const RpcResult& response) {
             if (epoch != session)
                 return;
             if (!response.ok || !response.value.isDouble() || response.value.toInteger(-1) < 0) {
@@ -120,7 +131,7 @@ void ProfileController::cancelProfileLabels(const QStringList& labels, int index
                     true);
                 return;
             }
-            cancelProfileLabels(labels, index + 1, eraseProfile);
+            cancelProfileLabels(labels, eraseProfile);
         },
         true);
 }
