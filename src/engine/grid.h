@@ -15,23 +15,31 @@ enum class Side { Long, Short, None };
 enum class Role { Entry, Take };
 enum class Status { Pending, Open, Uncertain, Terminal, Rejected };
 enum class Mutation { None, Create, Edit, Cancel };
-struct Band { Int low = 0, high = 0, budget = 0; int levels = 10; };
+
+struct Band {
+    Int low = 0, high = 0, budget = 0;
+    int levels = 10;
+};
+
 struct Config {
     std::string instrument = "BTC_USDC-PERPETUAL";
     bool production = false;
     Band longs, shorts;
 };
+
 struct Spec {
     Int priceTick = 0, quantityStep = 0;
     std::vector<std::pair<Int, Int>> tickSteps;
     Int tickAt(Int price) const;
 };
+
 struct Cycle {
     Int id = 0, generation = 0;
     Side side = Side::Long;
     Int entry = 0, take = 0, capacity = 0, held = 0;
     bool retired = false;
 };
+
 struct Order {
     std::string label, exchangeId;
     Int cycle = 0;
@@ -44,8 +52,19 @@ struct Order {
     bool live() const;
     Int remaining() const;
 };
-struct ForeignOrder { std::string id; bool buy = false; Int price = 0; bool conditional = false, reduceOnly = false; };
-struct Level { Int entry = 0, take = 0; Side side = Side::Short; };
+
+struct ForeignOrder {
+    std::string id;
+    bool buy = false;
+    Int price = 0;
+    bool conditional = false, reduceOnly = false;
+};
+
+struct Level {
+    Int entry = 0, take = 0;
+    Side side = Side::Short;
+};
+
 struct Preview {
     Spec spec;
     std::vector<Level> lattice;
@@ -53,6 +72,7 @@ struct Preview {
     std::vector<bool> allocated;
     std::array<int, 2> freeSlots{};
 };
+
 struct Action {
     Mutation kind = Mutation::None;
     std::string label, exchangeId;
@@ -60,6 +80,7 @@ struct Action {
     Role role = Role::Entry;
     Int price = 0, total = 0;
 };
+
 struct Update {
     std::string label, exchangeId;
     Int total = 0, filled = 0, time = 0, price = 0;
@@ -72,12 +93,26 @@ public:
     Config config;
     Spec spec;
     std::string profileId;
-    const std::vector<Cycle>& cycles() const { return cycles_; }
-    const std::vector<Order>& orders() const { return orders_; }
+
+    const std::vector<Cycle>& cycles() const
+    {
+        return cycles_;
+    }
+
+    const std::vector<Order>& orders() const
+    {
+        return orders_;
+    }
+
     void restoreRecords(std::vector<Cycle> cycles, std::vector<Order> orders);
     void importCycle(Cycle cycle);
     void importOrder(Order order);
-    std::uint64_t revision() const { return revision_; }
+
+    std::uint64_t revision() const
+    {
+        return revision_;
+    }
+
     std::vector<ForeignOrder> foreign;
     std::vector<Level> lattice;
     Side active = Side::None;
@@ -126,14 +161,24 @@ public:
     bool buys(const Order& order) const;
     Int nominal(Int lots, Int price) const;
     Int lotsFor(Int budget, Int price) const;
+
 private:
     std::vector<Cycle> cycles_;
     std::vector<Order> orders_;
     std::unordered_map<Int, size_t> cycleIndex_;
     std::unordered_map<std::string, size_t> labelIndex_, exchangeIndex_;
     std::unordered_set<size_t> liveIndices_;
-    struct Totals { Int reserved = 0; int occupied = 0, positioned = 0; };
-    struct Links { std::optional<size_t> entry, take; Totals contribution; };
+
+    struct Totals {
+        Int reserved = 0;
+        int occupied = 0, positioned = 0;
+    };
+
+    struct Links {
+        std::optional<size_t> entry, take;
+        Totals contribution;
+    };
+
     std::unordered_map<Int, Links> links_;
     std::array<Totals, 2> totals_{};
     std::uint64_t revision_ = 0;
@@ -146,6 +191,13 @@ private:
     unsigned rebuildSelection(const Config& next, bool onlyChanged) const;
     Engine movePreview() const;
     bool prepareMove(Side side, bool resize, const Engine& view);
+    void updateMovingQuote();
+    void refreshMovingLevels();
+    void replaceMovingLevels(Side side, const Engine& view);
+    Int moveStep(Side side) const;
+    bool canFollowPrice(Side side) const;
+    bool tryFollowPrice(Side side);
+    bool levelsChanged(Side side, const Engine& view) const;
     void refreshCycle(Int id);
     void refreshOrder(size_t index);
     Cycle* mutableCycle(Int id);
@@ -156,8 +208,32 @@ private:
     bool crossing(bool buy, Int price, bool foreignOnly = false) const;
     bool entryConflict(bool buy, Int price) const;
     bool build();
+    void retireRebuiltCycles(unsigned sides, Side moving);
+    void installMovedLevels();
+    bool buildSide(Side side, unsigned sides);
+    Level roundedLevel(Side side, Int price, Int previous) const;
+    void rejectDenseGrid(Side side, unsigned sides);
     std::optional<Action> create(Cycle& cycle, Role role, Int lots);
     Action mutate(Order& order, Mutation kind, Int total = 0);
+    bool hasUnresolvedOrders() const;
+    std::optional<Action> cancelRequestedOrders();
+    Cycle* unprotectedCycle();
+    std::optional<Action> protectCycle(Cycle& cycle);
+    std::optional<Action> clearTakeConflict(const Cycle& cycle, bool buy);
+    std::optional<Action> nextGridAction();
+    void resizeTransition();
+    void resizeReleasedSlots();
+    std::optional<Action> cancelRetiredEntries();
+    bool finishRebuild();
+    std::optional<Action> nextEntryAction();
+    std::optional<Action> retireExcessCapacity();
+    std::optional<Action> cancelConflictingEntry();
+    std::optional<Action> repeatEntry();
+    std::optional<Action> allocateEntry();
+    int offGridAllocations(Side side) const;
+    bool levelAllocated(const Level& level) const;
+    std::optional<Action> allocateEntryOnSide(Side side);
 };
+
 std::string sideName(Side side);
 }

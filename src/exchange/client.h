@@ -15,22 +15,31 @@ struct RpcResult {
     QString error;
     bool uncertain = false;
 };
+
 class Client : public QObject {
     Q_OBJECT
 public:
     using Callback = std::function<void(const RpcResult&)>;
     explicit Client(QObject* parent = nullptr);
     ~Client() override;
-    void connectTo(const QString& id, const QString& secret, bool production, const QUrl& testEndpoint = {});
+    void connectTo(
+        const QString& id, const QString& secret, bool production, const QUrl& testEndpoint = {});
     void stop();
-    qint64 call(const QString& method, const QJsonObject& params, Callback callback, bool mutation = false);
-    bool authenticated() const { return authorized; }
+    qint64 call(
+        const QString& method, const QJsonObject& params, Callback callback, bool mutation = false);
+
+    bool authenticated() const
+    {
+        return authorized;
+    }
+
     struct ConnectionStatus {
         enum class State { Idle, Connecting, Online, Offline };
         State state = State::Idle;
         qint64 milliseconds = -1;
         bool waiting = false, slow = false;
     };
+
     ConnectionStatus connectionStatus() const;
     void setTradingLimits(const QJsonObject& limits);
 signals:
@@ -38,8 +47,15 @@ signals:
     void lost();
     void notice(const QString& text);
     void subscription(const QString& channel, const QJsonValue& data);
+
 private:
-    struct Pending { Callback callback; qint64 deadline; bool mutation; qint64 sentAt = -1; };
+    struct Pending {
+        Callback callback;
+        qint64 deadline;
+        bool mutation;
+        qint64 sentAt = -1;
+    };
+
     QWebSocket socket;
     QTimer retry, refresh, watchdog, sendTimer;
     QElapsedTimer clock;
@@ -54,6 +70,8 @@ private:
     bool wanted = false, authorized = false;
     bool connectionFailed = false;
     void authenticate(bool renew);
+    void receiveAuthentication(const RpcResult& r, bool renew);
+    void enableHeartbeat(const QJsonObject& auth);
     void receive(const QString& message);
     void disconnected();
     void sendNext();

@@ -3,7 +3,7 @@ project(DeribitGrid VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(GRID_BUILD_GUI "Build the Qt desktop application" ON)
-add_library(grid_core src/grid.cpp src/grid_rebuild.cpp)
+add_library(grid_core src/engine/grid.cpp src/engine/grid_rebuild.cpp)
 target_include_directories(grid_core PUBLIC src .deps/boost_1_89_0)
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.deps/boost_1_89_0/boost/multiprecision/cpp_int.hpp")
   message(FATAL_ERROR "Install Boost 1.89.0 headers in .deps/boost_1_89_0 (see scripts/dependencies.py)")
@@ -25,22 +25,34 @@ if(GRID_BUILD_GUI)
   set(CMAKE_INSTALL_BINDIR ".")
   find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets WebSockets Network Sql Test)
   qt_standard_project_setup()
-  qt_add_executable(DeribitGrid WIN32 src/main.cpp src/window.cpp src/window_ui.cpp src/controller.cpp src/client.cpp src/store.cpp)
+  set(GRID_DESKTOP_SOURCES
+    src/ui/window.cpp
+    src/ui/window_ui.cpp
+    src/ui/window_display.cpp
+    src/ui/window_exchange.cpp
+    src/ui/window_reconcile.cpp
+    src/ui/window_orders.cpp
+    src/profile/profile_controller.cpp
+    src/trading/controller.cpp
+    src/exchange/client.cpp
+    src/storage/store.cpp
+  )
+  qt_add_executable(DeribitGrid WIN32 src/main.cpp ${GRID_DESKTOP_SOURCES})
   target_link_libraries(DeribitGrid PRIVATE grid_core Qt6::Widgets Qt6::WebSockets Qt6::Network Qt6::Sql)
   if(BUILD_TESTING)
-    qt_add_executable(storage_tests tests/storage_tests.cpp src/store.cpp)
+    qt_add_executable(storage_tests tests/storage_tests.cpp src/storage/store.cpp)
     target_link_libraries(storage_tests PRIVATE grid_core Qt6::Sql Qt6::Test)
     add_test(NAME storage_recovery COMMAND storage_tests)
-    qt_add_executable(client_tests tests/client_tests.cpp src/client.cpp)
+    qt_add_executable(client_tests tests/client_tests.cpp src/exchange/client.cpp)
     target_include_directories(client_tests PRIVATE src)
     target_link_libraries(client_tests PRIVATE Qt6::WebSockets Qt6::Network Qt6::Test)
     add_test(NAME websocket_protocol COMMAND client_tests)
-    qt_add_executable(window_tests tests/window_tests.cpp src/window.cpp src/window_ui.cpp src/controller.cpp src/client.cpp src/store.cpp)
+    qt_add_executable(window_tests tests/window_tests.cpp ${GRID_DESKTOP_SOURCES})
     target_link_libraries(window_tests PRIVATE grid_core Qt6::Widgets Qt6::WebSockets Qt6::Network Qt6::Sql Qt6::Test)
     set_target_properties(window_tests PROPERTIES WIN32_EXECUTABLE FALSE)
     add_test(NAME desktop_execution COMMAND window_tests -platform offscreen -o "${CMAKE_CURRENT_BINARY_DIR}/window-tests.xml,junitxml" -o -,txt)
     set_tests_properties(desktop_execution PROPERTIES TIMEOUT 180)
-    qt_add_executable(controller_tests tests/controller_tests.cpp src/controller.cpp src/client.cpp src/store.cpp)
+    qt_add_executable(controller_tests tests/controller_tests.cpp src/trading/controller.cpp src/exchange/client.cpp src/storage/store.cpp)
     target_link_libraries(controller_tests PRIVATE grid_core Qt6::WebSockets Qt6::Network Qt6::Sql Qt6::Test)
     set_target_properties(controller_tests PROPERTIES WIN32_EXECUTABLE FALSE)
     add_test(NAME durable_request_boundary COMMAND controller_tests)
@@ -58,7 +70,7 @@ if(GRID_BUILD_BENCHMARKS)
   add_executable(engine_benchmark tests/engine_benchmark.cpp)
   target_link_libraries(engine_benchmark PRIVATE grid_core)
   if(GRID_BUILD_GUI)
-    add_executable(storage_benchmark tests/storage_benchmark.cpp src/store.cpp)
+    add_executable(storage_benchmark tests/storage_benchmark.cpp src/storage/store.cpp)
     target_link_libraries(storage_benchmark PRIVATE grid_core Qt6::Sql Qt6::Core)
     if(WIN32)
       target_link_libraries(storage_benchmark PRIVATE psapi)

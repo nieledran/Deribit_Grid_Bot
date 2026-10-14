@@ -1,11 +1,12 @@
 #pragma once
-#include "grid.h"
+#include "engine/grid.h"
 #include <QJsonObject>
 #include <QSqlDatabase>
 #include <QString>
 
 QJsonObject encodeEngine(const grid::Engine& engine, bool records = true);
 grid::Engine decodeEngine(const QJsonObject& object);
+
 class Store {
 public:
     explicit Store(const QString& path);
@@ -24,6 +25,7 @@ public:
     QStringList missingFees();
     bool feesComplete();
     void bindAccount(const QString& identity);
+
 private:
     QSqlDatabase db;
     QString connection;
