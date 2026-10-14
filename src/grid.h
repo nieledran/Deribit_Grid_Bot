@@ -145,7 +145,7 @@ private:
     bool rebuildCancels(const Cycle& cycle) const;
     unsigned rebuildSelection(const Config& next, bool onlyChanged) const;
     Engine movePreview() const;
-    bool prepareMove(Side side, bool resize);
+    bool prepareMove(Side side, bool resize, const Engine& view);
     void refreshCycle(Int id);
     void refreshOrder(size_t index);
     Cycle* mutableCycle(Int id);

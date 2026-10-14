@@ -63,6 +63,12 @@ private:
     std::vector<std::string> absentCreates;
     QJsonArray bufferedOrders;
     QJsonArray bufferedTrades;
+    static QString text(const std::string& value);
+    static double price(grid::Int value);
+    static QString amount(grid::Int lots, const grid::Spec& spec);
+    static QString role(grid::Role role);
+    static QString positionDetails(const grid::Engine& engine, grid::Int actual);
+    void setupUi();
     grid::Config uiConfig() const;
     void setConfig(const grid::Config& config);
     void save();

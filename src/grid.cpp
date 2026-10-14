@@ -309,10 +309,10 @@ std::optional<Action> Engine::nextAction() {
     if (!blocked && !pendingConfig && (running || rebuilding) && movingSide_ == Side::None && (rebuildFloor[0] > 1 || rebuildFloor[1] > 1)) {
         for (const auto side : {Side::Long, Side::Short}) if (band(side).budget && rebuildFloor[sideIndex(side)] > 1) {
             const auto count = std::count_if(lattice.begin(), lattice.end(), [side](const Level& l) { return l.side == side; });
-            if (count != transitionSlots(side)) { prepareMove(side, true); break; }
+            if (count != transitionSlots(side)) { prepareMove(side, true, movePreview()); break; }
         }
     }
-    if (transitionResize_) prepareMove(movingSide_, true); // Include fills/quotes that raced cancellation.
+    if (transitionResize_) prepareMove(movingSide_, true, movePreview()); // Include fills/quotes that raced cancellation.
     for (auto& o : orders_) if (o.live() && o.role == Role::Entry &&
         (!running || blocked || cycle(o.cycle)->retired || rebuildCancels(*cycle(o.cycle))))
         return mutate(o, Mutation::Cancel);

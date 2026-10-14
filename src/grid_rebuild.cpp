@@ -34,8 +34,7 @@ Engine Engine::movePreview() const {
     for (auto c : cycles_) if (c.id < rebuildFloor[sideIndex(c.side)] && c.held > 0) { c.retired = true; view.importCycle(c); }
     view.build(); return view;
 }
-bool Engine::prepareMove(Side side, bool resize) {
-    auto view = movePreview();
+bool Engine::prepareMove(Side side, bool resize, const Engine& view) {
     if (view.blocked) {
         if (resize) { blocked = true; problem = view.problem; ++revision_; }
         return false;
@@ -92,7 +91,7 @@ void Engine::quote(Int b, Int a) {
             if (old->entry != next->entry) { changed = true; break; }
             ++old; ++next;
         }
-        if (changed) { prepareMove(side, false); break; }
+        if (changed) { prepareMove(side, false, view); break; }
     }
 }
 unsigned Engine::rebuildSelection(const Config& next, bool onlyChanged) const {
