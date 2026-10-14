@@ -90,7 +90,7 @@ private:
     void refreshFees(const QString& orderId);
     void readMarket(const QJsonObject& ticker);
     void refreshAccount();
-    void startGrid();
+    void startGrid(bool onlyChanged = false);
     void resetStats();
     void resetHistory();
 };

@@ -4,6 +4,7 @@
 #include <QTemporaryDir>
 #include <QWebSocketServer>
 #include <QMessageBox>
+#include <QSpinBox>
 #include <QtTest>
 #include <stdexcept>
 #include <algorithm>
@@ -12,6 +13,105 @@ using namespace grid;
 class WindowTests : public QObject {
     Q_OBJECT
 private slots:
+    void applyRebuildsOnlyChangedSide_data() {
+        QTest::addColumn<bool>("eth");
+        QTest::newRow("BTC") << false; QTest::newRow("ETH") << true;
+    }
+    void applyRebuildsOnlyChangedSide() {
+        QFETCH(bool, eth);
+        const QString instrument = eth ? "ETH_USDC-PERPETUAL" : "BTC_USDC-PERPETUAL";
+        const Int mid = (eth ? 2500 : 82500) * Scale, width = (eth ? 100 : 1000) * Scale;
+        QTemporaryDir dir; const auto path = dir.filePath("selective.db");
+        Engine seed; seed.profileId = "apply"; seed.config.instrument = instrument.toStdString();
+        seed.spec = {eth ? Scale / 100 : Scale / 10, Scale / 10000, {}};
+        seed.config.longs = {mid - width, mid, 100 * Dollars, 3};
+        seed.config.shorts = {mid, mid + width, 100 * Dollars, 3};
+        seed.quote(mid, mid); seed.requestRebuild(seed.config);
+        QHash<QString, QJsonObject> orders; qint64 timestamp = 1;
+        const auto orderJson = [&](const Order& o) {
+            return QJsonObject{{"instrument_name", instrument}, {"order_id", QString::fromStdString(o.exchangeId)},
+                {"label", QString::fromStdString(o.label)}, {"order_type", "limit"}, {"order_state", "open"},
+                {"direction", seed.buys(o) ? "buy" : "sell"}, {"price", double(o.price) / Scale},
+                {"amount", double(o.total) * seed.spec.quantityStep / Scale}, {"filled_amount", 0.0}, {"last_update_timestamp", ++timestamp}};
+        };
+        while (const auto action = seed.nextAction()) {
+            const auto o = *seed.order(action->label);
+            seed.apply({o.label, "ex-" + o.label, o.total, 0, ++timestamp, o.price, false}); seed.resolved(o.label);
+            const auto j = orderJson(*seed.order(o.label)); orders.insert(j["order_id"].toString(), j);
+        }
+        QCOMPARE(orders.size(), 6); { Store db(path); db.save(seed); }
+        const auto saved = [&] { Store db(path); Engine e; db.load(e); return e; };
+        QStringList cancelled, created;
+        QWebSocketServer server("Selective Apply", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        connect(&server, &QWebSocketServer::newConnection, this, [&] {
+            auto* peer = server.nextPendingConnection(); peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
+                const auto request = QJsonDocument::fromJson(frame.toUtf8()).object();
+                const auto method = request["method"].toString(); const auto params = request["params"].toObject();
+                QJsonValue result = QJsonObject{};
+                if (method == "public/auth") result = QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
+                else if (method == "public/get_instrument") result = QJsonObject{{"instrument_name", instrument},
+                    {"base_currency", eth ? "ETH" : "BTC"}, {"settlement_currency", "USDC"}, {"kind", "future"},
+                    {"settlement_period", "perpetual"}, {"state", "open"}, {"tick_size", eth ? 0.01 : 0.1}, {"min_trade_amount", 0.0001}};
+                else if (method == "private/get_account_summary") result = QJsonObject{{"id", eth ? 2945601 : 2945602},
+                    {"limits", QJsonObject{{"matching_engine", QJsonObject{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 5}}}}}}}}}};
+                else if (method == "public/ticker") result = QJsonObject{{"instrument_name", instrument},
+                    {"best_bid_price", double(mid) / Scale - 0.01}, {"best_ask_price", double(mid) / Scale + 0.01}};
+                else if (method == "private/get_position") result = QJsonObject{{"size_currency", 0.0}};
+                else if (method == "private/get_open_orders_by_instrument") {
+                    QJsonArray open; for (const auto& o : orders) if (o["order_state"] == "open") open.append(o); result = open;
+                } else if (method == "private/get_order_state") {
+                    result = orders.value(params["order_id"].toString());
+                } else if (method == "private/get_user_trades_by_order") result = QJsonArray{};
+                else if (method == "private/buy" || method == "private/sell") {
+                    const auto id = "ex-" + params["label"].toString(); created.append(id);
+                    const QJsonObject order{{"instrument_name", instrument}, {"order_id", id}, {"label", params["label"]},
+                        {"order_type", "limit"}, {"order_state", "open"}, {"direction", method == "private/buy" ? "buy" : "sell"},
+                        {"price", params["price"]}, {"amount", params["amount"]}, {"filled_amount", 0.0}, {"last_update_timestamp", ++timestamp}};
+                    orders[id] = order; result = QJsonObject{{"order", order}};
+                } else if (method == "private/cancel") {
+                    const auto id = params["order_id"].toString(); cancelled.append(id); auto order = orders.value(id);
+                    order["order_state"] = "cancelled"; order["last_update_timestamp"] = ++timestamp; orders[id] = order; result = order;
+                }
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"id", request["id"]}, {"result", result}}).toJson()));
+            });
+        });
+        Window window(path, instrument, nullptr, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        window.findChild<QLineEdit*>("clientId")->setText("fake"); window.findChild<QLineEdit*>("clientSecret")->setText("fake");
+        window.findChild<QPushButton*>("connect")->click();
+        QTRY_VERIFY2_WITH_TIMEOUT(window.findChild<QLabel*>("connectionStatus")->text() == "Connected",
+            qPrintable(window.findChild<QPlainTextEdit*>()->toPlainText()), 5000);
+        // Opening a profile intentionally pauses it; establish a running grid first.
+        auto* start = window.findChild<QPushButton*>("start"); QTRY_VERIFY(start->isEnabled()); start->click();
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return e.running && !e.rebuilding &&
+            e.occupiedSlots(Side::Long) == 3 && e.occupiedSlots(Side::Short) == 3 &&
+            std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 7000);
+        QHash<QString, QJsonObject> original;
+        for (auto i = orders.cbegin(); i != orders.cend(); ++i) if (i.value()["order_state"] == "open") original.insert(i.key(), i.value());
+        cancelled.clear(); created.clear();
+        QTableWidget* settings = nullptr;
+        for (auto* table : window.findChildren<QTableWidget*>()) if (table->rowCount() == 2 && table->columnCount() == 5) settings = table;
+        QVERIFY(settings);
+        auto* apply = window.findChild<QPushButton*>("applySettings"); QTRY_VERIFY(apply->isEnabled());
+        qobject_cast<QSpinBox*>(settings->cellWidget(0, 4))->setValue(4); apply->click();
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return !e.rebuilding && e.config.longs.levels == 4 &&
+            e.occupiedSlots(Side::Long) == 4 && std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 7000);
+        QCOMPARE(cancelled.size(), 3); QCOMPARE(created.size(), 4);
+        for (const auto& id : cancelled) QCOMPARE(orders[id]["direction"].toString(), QString("buy"));
+        for (const auto& o : original) if (o["direction"] == "sell") QCOMPARE(orders[o["order_id"].toString()], o);
+        const auto after = saved(); const auto shorts = after.rebuildFloor[1];
+        QTRY_VERIFY(apply->isEnabled()); apply->click(); QTest::qWait(600);
+        QCOMPARE(cancelled.size(), 3); QCOMPARE(created.size(), 4); QCOMPARE(saved().nextOrder, after.nextOrder);
+        QVERIFY(window.findChild<QPlainTextEdit*>()->toPlainText().contains("Settings unchanged"));
+        qobject_cast<QSpinBox*>(settings->cellWidget(1, 4))->setValue(2); QTRY_VERIFY(apply->isEnabled()); apply->click();
+        QTRY_VERIFY_WITH_TIMEOUT(([&] { const auto e = saved(); return !e.rebuilding && e.config.shorts.levels == 2 &&
+            e.occupiedSlots(Side::Short) == 2 && std::all_of(e.orders().begin(), e.orders().end(), [](const Order& o) { return o.mutation == Mutation::None; }); })(), 7000);
+        QCOMPARE(cancelled.size(), 6); QCOMPARE(created.size(), 6);
+        const auto final = saved(); QCOMPARE(final.rebuildFloor[0], after.rebuildFloor[0]); QVERIFY(final.rebuildFloor[1] > shorts);
+        for (const auto& o : after.orders()) if (after.cycle(o.cycle)->side == Side::Long && o.live()) {
+            QCOMPARE(final.order(o.label)->exchangeId, o.exchangeId); QCOMPARE(final.order(o.label)->status, Status::Open);
+        }
+    }
     void latencyIndicatorShowsSlowConnectionAndRecovery() {
         QTemporaryDir dir;
         QWebSocketServer server("UI latency", QWebSocketServer::NonSecureMode); QVERIFY(server.listen(QHostAddress::LocalHost, 0));
@@ -41,7 +141,7 @@ private slots:
         Engine seed; seed.profileId = "transitionui"; seed.spec = {Scale / 10, Scale / 10000, {}};
         seed.config.longs = {82500 * Scale, 84500 * Scale, 850 * Dollars, 14};
         for (int i = 0; i < 6; ++i) seed.importCycle({seed.nextCycle++, 0, Side::Long, (83700 + i) * Scale, (83800 + i) * Scale, 2, 2, true});
-        seed.rebuildFloor = seed.nextCycle;
+        seed.rebuildFloor = {seed.nextCycle, seed.nextCycle};
         { Store db(path); db.save(seed); }
         Window window(path, "BTC_USDC-PERPETUAL"); window.show();
         auto* latency = window.findChild<QLabel*>("connectionLatency");

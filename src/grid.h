@@ -82,7 +82,10 @@ public:
     std::vector<Level> lattice;
     Side active = Side::None;
     Int generation = 0, nextCycle = 1, nextOrder = 1, historyFloor = 1;
-    Int rebuildFloor = 1; // Cycles below this ID belong to the last explicit rebuild.
+    // Each side keeps its own cohort when Apply changes only the other side.
+    std::array<Int, 2> rebuildFloor{1, 1};
+    std::array<Int, 2> anchors{};
+    unsigned rebuildSides = 0; // Pending explicit rebuild: Long=1, Short=2.
     Int market = 0, bid = 0, ask = 0;
     bool running = false, rebuilding = false, cancelEverything = false;
     bool blocked = false;
@@ -94,7 +97,7 @@ public:
     static std::string validate(const Config& config);
     Side sideAt(Int price) const;
     void quote(Int bestBid, Int bestAsk);
-    void requestRebuild(const Config& next);
+    unsigned requestRebuild(const Config& next, bool onlyChanged = false);
     void pause();
     void cancelAll();
     void disconnected();
@@ -103,9 +106,9 @@ public:
     void uncertain(const std::string& label);
     void apply(const Update& update);
     std::optional<Action> nextAction();
-    Preview preview(const Config& next) const;
+    Preview preview(const Config& next, bool onlyChanged = false) const;
     Preview currentPreview() const;
-    bool settled() const;
+    bool settled(unsigned sides = 3) const;
     Int trackedPosition() const;
     bool positionMatches(Int actual) const;
     bool reconcilePosition(Int actual);
@@ -139,9 +142,10 @@ private:
     Int extreme_ = 0, movingAnchor_ = 0;
     std::vector<Level> movingLevels_;
     bool retainedLevel(const Cycle& cycle) const;
+    bool rebuildCancels(const Cycle& cycle) const;
+    unsigned rebuildSelection(const Config& next, bool onlyChanged) const;
     Engine movePreview() const;
     bool prepareMove(Side side, bool resize);
-    std::array<Int, 2> anchors_{};
     void refreshCycle(Int id);
     void refreshOrder(size_t index);
     Cycle* mutableCycle(Int id);

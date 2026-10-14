@@ -23,7 +23,7 @@ private slots:
         auto take = e.nextAction(); QVERIFY(take && take->role == Role::Take); finish(e, *take);
         e.requestRebuild(e.config);
         while (const auto a = e.nextAction()) finish(e, *a);
-        QCOMPARE(e.lattice.size(), size_t(2)); QCOMPARE(e.rebuildFloor, Int(2));
+        QCOMPARE(e.lattice.size(), size_t(2)); QCOMPARE(e.rebuildFloor[0], Int(2));
         auto restored = decodeEngine(encodeEngine(e));
         restored.quote(83500 * Scale, 83500 * Scale);
         QCOMPARE(restored.transitionSlots(Side::Long), 2); QVERIFY(restored.transitioning(Side::Long));
@@ -34,11 +34,75 @@ private slots:
         restored = decodeEngine(encodeEngine(restored));
         restored.quote(83490 * Scale, 83490 * Scale);
         while (const auto a = restored.nextAction()) finish(restored, *a);
-        QCOMPARE(restored.rebuildFloor, Int(2)); QCOMPARE(restored.lattice.size(), size_t(3));
+        QCOMPARE(restored.rebuildFloor[0], Int(2)); QCOMPARE(restored.lattice.size(), size_t(3));
         QCOMPARE(restored.lattice.back().entry, 82500 * Scale); QVERIFY(!restored.transitioning(Side::Long));
         // Existing profiles have no cohort marker and remain readable.
-        auto legacy = encodeEngine(restored); legacy.remove("rebuildFloor"); QCOMPARE(decodeEngine(legacy).rebuildFloor, Int(1));
-        auto invalid = encodeEngine(restored); invalid["rebuildFloor"] = restored.nextCycle + 1;
+        auto legacy = encodeEngine(restored); legacy["version"] = 4;
+        QCOMPARE(decodeEngine(legacy).rebuildFloor[0], Int(1));
+        legacy["rebuildFloor"] = 2;
+        QCOMPARE(decodeEngine(legacy).rebuildFloor[0], Int(2)); QCOMPARE(decodeEngine(legacy).rebuildFloor[1], Int(2));
+        auto invalid = encodeEngine(restored); invalid["rebuildLongFloor"] = restored.nextCycle + 1;
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(invalid));
+    }
+    void selectiveRebuildSurvivesRestart_data() {
+        QTest::addColumn<bool>("longSide"); QTest::addColumn<bool>("racedFill");
+        QTest::newRow("Long-pending") << true << false;
+        QTest::newRow("Short-pending") << false << false;
+        QTest::newRow("Long-raced-fill") << true << true;
+        QTest::newRow("Short-raced-fill") << false << true;
+    }
+    void selectiveRebuildSurvivesRestart() {
+        QFETCH(bool, longSide); QFETCH(bool, racedFill);
+        QTemporaryDir dir; Store store(dir.filePath("selective.db"));
+        Engine e; e.profileId = "selective"; e.spec = {Scale / 10, Scale / 10000, {}};
+        e.config.longs = {80000 * Scale, 84500 * Scale, 850 * Dollars, 3};
+        e.config.shorts = {84500 * Scale, 90000 * Scale, 850 * Dollars, 3};
+        e.quote(84600 * Scale, 84600 * Scale); e.requestRebuild(e.config);
+        const auto finish = [](Engine& engine, const Action& a, Int fill = 0) {
+            auto o = *engine.order(a.label);
+            if (a.kind == Mutation::Edit) o.total = a.total;
+            engine.apply({o.label, o.exchangeId.empty() ? "ex-" + o.label : o.exchangeId,
+                o.total, std::max(o.filled, fill), o.exchangeTime + 1, o.price, a.kind == Mutation::Cancel});
+            engine.resolved(a.label);
+        };
+        while (const auto a = e.nextAction()) finish(e, *a);
+        const auto side = longSide ? Side::Long : Side::Short, other = longSide ? Side::Short : Side::Long;
+        const size_t index = static_cast<size_t>(side), otherIndex = static_cast<size_t>(other);
+        const auto originals = e.orders(); const auto floors = e.rebuildFloor; const auto anchors = e.anchors;
+        auto next = e.config; (longSide ? next.longs : next.shorts).levels = 4;
+        QCOMPARE(e.requestRebuild(next, true), longSide ? 1u : 2u);
+        const auto pending = e.nextAction(); QVERIFY(pending && pending->kind == Mutation::Cancel);
+        if (racedFill) finish(e, *pending, 1);
+        const auto actual = e.orders(); e.disconnected(); store.save(e);
+        Engine restored; QVERIFY(store.load(restored));
+        QVERIFY(restored.pendingConfig); QCOMPARE(restored.rebuildSides, longSide ? 1u : 2u);
+        QCOMPARE(restored.rebuildFloor[otherIndex], floors[otherIndex]); QCOMPARE(restored.anchors, anchors);
+        QVERIFY(!restored.nextAction());
+        restored.quote(84600 * Scale, 84600 * Scale);
+        // The exchange snapshots resolve all uncertain orders before rebuilding.
+        for (const auto& o : actual) if (restored.order(o.label)->status == Status::Uncertain) {
+            restored.apply({o.label, o.exchangeId, o.total, o.filled, o.exchangeTime + 1, o.price, o.status == Status::Terminal});
+            restored.resolved(o.label);
+        }
+        int cancels = 0, creates = 0, takes = 0;
+        while (const auto a = restored.nextAction()) {
+            QCOMPARE(restored.cycle(restored.order(a->label)->cycle)->side, side);
+            cancels += a->kind == Mutation::Cancel; creates += a->kind == Mutation::Create && a->role == Role::Entry;
+            takes += a->role == Role::Take; finish(restored, *a);
+            store.save(restored);
+        }
+        QCOMPARE(cancels, racedFill ? 2 : 3); QCOMPARE(creates, racedFill ? 3 : 4); QCOMPARE(takes, racedFill ? 1 : 0);
+        for (const auto& o : originals) if (restored.cycle(o.cycle)->side == other) {
+            QCOMPARE(restored.order(o.label)->exchangeId, o.exchangeId); QCOMPARE(restored.order(o.label)->total, o.total);
+            QCOMPARE(restored.order(o.label)->status, Status::Open); QVERIFY(!restored.cycle(o.cycle)->retired);
+        }
+        QVERIFY(!restored.rebuilding); QCOMPARE(restored.rebuildSides, 0u);
+        store.save(restored); QVERIFY(store.load(e)); QCOMPARE(e.rebuildFloor[index], Int(7));
+        QCOMPARE(e.rebuildFloor[otherIndex], floors[otherIndex]); QCOMPARE(e.anchors[otherIndex], anchors[otherIndex]);
+        QCOMPARE(e.transitionSlots(side), racedFill ? 3 : 4);
+        auto invalid = encodeEngine(e); invalid["rebuildSides"] = 1;
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(invalid));
+        invalid = encodeEngine(e); invalid["longAnchor"] = -1;
         QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(invalid));
     }
     void constructorFailureReleasesConnection() {
@@ -49,7 +113,7 @@ private slots:
     }
     void nativeIntegersRejectFractionsAndOverflow() {
         Engine e; e.profileId = "typed";
-        auto json = encodeEngine(e); QCOMPARE(json["version"].toInt(), 4);
+        auto json = encodeEngine(e); QCOMPARE(json["version"].toInt(), 5);
         QVERIFY(json["nextOrder"].isDouble());
         json["nextOrder"] = "1"; QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(json));
         json = encodeEngine(e); json["nextOrder"] = 1.5; QVERIFY_THROWS_EXCEPTION(std::runtime_error, decodeEngine(json));

@@ -167,8 +167,8 @@ Window::Window(const QString& profile, const QString& initialInstrument, QWidget
     connect(clearLogButton, &QPushButton::clicked, journal, &QPlainTextEdit::clear);
     connect(resetButton, &QPushButton::clicked, this, &Window::resetHistory);
     connect(connectButton, &QPushButton::clicked, this, &Window::connectExchange);
-    connect(startButton, &QPushButton::clicked, this, &Window::startGrid);
-    connect(applyButton, &QPushButton::clicked, this, &Window::startGrid);
+    connect(startButton, &QPushButton::clicked, this, [this] { startGrid(); });
+    connect(applyButton, &QPushButton::clicked, this, [this] { startGrid(true); });
     connect(pauseButton, &QPushButton::clicked, this, [this] { engine.pause(); save(); log("Pausing: cancelling entries and protecting fills"); render(); });
     connect(cancelButton, &QPushButton::clicked, this, [this] {
         if (!ready) { cancelProfileOrders(false); return; }
@@ -679,13 +679,15 @@ void Window::refreshAccount() {
         } catch (const std::exception& e) { readBusy = false; log(QString::fromUtf8(e.what())); return; }
     });
 }
-void Window::startGrid() {
+void Window::startGrid(bool onlyChanged) {
     try {
         if (!ready || !marketClock.isValid() || marketClock.elapsed() > 10000) throw std::runtime_error("Wait for a fresh market quote and successful reconciliation");
         if (engine.cancelEverything && !engine.settled()) throw std::runtime_error("Wait until cancellation finishes");
         auto next = uiConfig();
         if (next.instrument != engine.config.instrument || next.production != engine.config.production) throw std::runtime_error("Reconnect with a separate profile for another instrument/environment");
-        previewBox->setChecked(false); engine.requestRebuild(next); save(); log("Rebuild requested: preserving old takes and reallocating free slots"); render();
+        previewBox->setChecked(false); const auto sides = engine.requestRebuild(next, onlyChanged); save();
+        log(!sides ? "Settings unchanged; current grids retained" : QString("Rebuild requested: %1; preserving old takes and reallocating free slots")
+            .arg(sides == 3 ? "Long + Short" : sides == 1 ? "Long" : "Short")); render();
     } catch (const std::exception& e) { QMessageBox::warning(this, "Cannot start", QString::fromUtf8(e.what())); }
 }
 void Window::resetHistory() {
@@ -823,7 +825,7 @@ void Window::render() {
     }
     ordersTable->setRowCount(orderRow);
     if (previewBox->isChecked()) {
-        try { renderPreview(engine.preview(uiConfig())); }
+        try { renderPreview(engine.preview(uiConfig(), true)); }
         catch (const std::exception& e) {
             previewTable->setRowCount(1); for (int col = 0; col < previewTable->columnCount(); ++col) cell(previewTable, 0, col, "");
             cell(previewTable, 0, 5, QString::fromUtf8(e.what()));

@@ -1,8 +1,10 @@
 #include "grid.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <source_location>
 #include <string>
 
 using namespace grid;
@@ -39,8 +41,9 @@ void ack(Engine& e, const Action& a, Int filled = 0, bool terminal = false, Int 
     auto u = snapshot(o, filled, terminal || a.kind == Mutation::Cancel, time);
     e.apply(u); e.resolved(a.label); verifyTotals(e);
 }
-Action requireAction(Engine& e, Mutation kind, Role role) {
-    auto a = e.nextAction(); check(a.has_value(), "Expected an action");
+Action requireAction(Engine& e, Mutation kind, Role role, std::source_location where = std::source_location::current()) {
+    auto a = e.nextAction(); ++checks;
+    if (!a) throw std::runtime_error("Expected an action at line " + std::to_string(where.line()) + ": " + e.problem);
     if (a->kind != kind || a->role != role) throw std::runtime_error("Unexpected action " + a->label + ": kind=" + std::to_string(static_cast<int>(a->kind)) + ", role=" + std::to_string(static_cast<int>(a->role)) + "; expected kind=" + std::to_string(static_cast<int>(kind)) + ", role=" + std::to_string(static_cast<int>(role)));
     ++checks; return *a;
 }
@@ -49,6 +52,145 @@ void completePause(Engine& e) {
         auto a = e.nextAction(); if (!a) break;
         ack(e, *a, e.order(a->label)->filled, false, 50 + i);
     }
+}
+std::vector<Action> finishActions(Engine& e) {
+    std::vector<Action> actions;
+    for (int i = 0; i < 2000; ++i) {
+        const auto a = e.nextAction(); if (!a) return actions;
+        actions.push_back(*a); const auto o = *e.order(a->label);
+        ack(e, *a, o.filled, false, o.exchangeTime + 1);
+    }
+    throw std::runtime_error("Grid did not settle");
+}
+std::vector<std::pair<Int, Int>> levelsFor(const std::vector<Level>& levels, Side side) {
+    std::vector<std::pair<Int, Int>> result;
+    for (const auto& l : levels) if (l.side == side) result.emplace_back(l.entry, l.take);
+    return result;
+}
+void selectiveSettingsRebuild() {
+    for (const auto side : {Side::Long, Side::Short}) for (int field = 0; field < 4; ++field) {
+        auto e = setup(14, true); finishActions(e);
+        const auto other = side == Side::Long ? Side::Short : Side::Long;
+        const auto originals = e.orders(); const auto originalCycles = e.cycles();
+        const auto levels = levelsFor(e.lattice, other);
+        const auto floors = e.rebuildFloor; const auto anchors = e.anchors;
+        auto next = e.config; auto& band = side == Side::Long ? next.longs : next.shorts;
+        if (field == 0) band.low += side == Side::Long ? -p(1) : p(1);
+        if (field == 1) band.high += side == Side::Long ? -p(1) : p(1);
+        if (field == 2) band.budget += 100 * Dollars;
+        if (field == 3) ++band.levels;
+        const auto view = e.preview(next, true);
+        check(levelsFor(view.lattice, other) == levels, "Selective preview preserves the other lattice");
+        check(e.requestRebuild(next, true) == (side == Side::Long ? 1u : 2u), "Only the settings-changed side is selected");
+        const auto actions = finishActions(e);
+        int cancels = 0, creates = 0;
+        for (const auto& action : actions) {
+            check(e.cycle(e.order(action.label)->cycle)->side == side, "No trading RPC for the unchanged side");
+            cancels += action.kind == Mutation::Cancel; creates += action.kind == Mutation::Create;
+        }
+        check(cancels == 14 && creates == band.levels, "Apply cancels and replaces only selected entries");
+        check(e.running && !e.rebuilding && !e.pendingConfig && !e.rebuildSides, "Selective rebuild completes");
+        check(levelsFor(e.lattice, other) == levels, "Other entry and take levels are unchanged");
+        check(e.rebuildFloor[static_cast<size_t>(other)] == floors[static_cast<size_t>(other)] &&
+            e.anchors[static_cast<size_t>(other)] == anchors[static_cast<size_t>(other)], "Other transition cohort and price anchor survive Apply");
+        for (const auto& c : originalCycles) if (c.side == other) {
+            const auto* after = e.cycle(c.id);
+            check(after && after->retired == c.retired && after->generation == c.generation && after->capacity == c.capacity,
+                "Other cycles retain allocation and generation");
+        }
+        for (const auto& o : originals) if (e.cycle(o.cycle)->side == other) {
+            const auto* after = e.order(o.label);
+            check(after && after->exchangeId == o.exchangeId && after->price == o.price && after->total == o.total &&
+                after->status == o.status && after->mutation == Mutation::None, "Other exchange orders are retained exactly");
+        }
+        const auto generation = e.generation, nextOrder = e.nextOrder;
+        check(e.requestRebuild(e.config, true) == 0 && !e.nextAction(), "Unchanged Apply sends no trading requests");
+        check(e.generation == generation && e.nextOrder == nextOrder, "Unchanged Apply does not restart transition or allocate orders");
+        verifyTotals(e);
+    }
+}
+void selectiveRebuildRacesAndTransitions() {
+    for (const auto side : {Side::Long, Side::Short}) {
+        auto e = setup(3, true); finishActions(e);
+        const auto other = side == Side::Long ? Side::Short : Side::Long;
+        Order untouched;
+        for (const auto& o : e.orders()) {
+            if (e.cycle(o.cycle)->side == other && untouched.label.empty()) untouched = o;
+        }
+        e.apply(snapshot(untouched, 2, false, 2));
+        const auto otherTake = requireAction(e, Mutation::Create, Role::Take); ack(e, otherTake);
+        const auto oldFloor = e.rebuildFloor[static_cast<size_t>(other)];
+        auto next = e.config; (side == Side::Long ? next.longs : next.shorts).budget += 100 * Dollars;
+        e.requestRebuild(next, true);
+        finishActions(e);
+        check(e.cycle(untouched.cycle)->held == 2 && !e.cycle(untouched.cycle)->retired && e.order(otherTake.label)->live(),
+            "Unchanged partially filled cycle remains repeatable with its take");
+        check(e.rebuildFloor[static_cast<size_t>(other)] == oldFloor && e.transitionSlots(other) == 3,
+            "Unchanged held cycle does not become an old transition slot");
+        const auto same = e.lattice;
+        // Closing its take replenishes the original entry, not a new lattice.
+        e.apply(snapshot(*e.order(otherTake.label), otherTake.total, true, 10));
+        const auto repeat = requireAction(e, Mutation::Edit, Role::Entry);
+        check(repeat.label == untouched.label && repeat.total == untouched.total + 2, "Unchanged side keeps partial-take repeat behavior"); ack(e, repeat, untouched.filled + 2, false, 11);
+        check(levelsFor(e.lattice, other) == levelsFor(same, other), "Other take close does not resize its lattice");
+        // A second Apply races a fill, without an artificially crossed opposite take.
+        next = e.config; (side == Side::Long ? next.longs : next.shorts).budget += 100 * Dollars;
+        e.requestRebuild(next, true);
+        auto cancel = requireAction(e, Mutation::Cancel, Role::Entry);
+        check(e.cycle(e.order(cancel.label)->cycle)->side == side, "Cancel belongs to selected side");
+        ack(e, cancel, 1, true, e.order(cancel.label)->exchangeTime + 1);
+        const auto take = requireAction(e, Mutation::Create, Role::Take);
+        check(take.price == e.cycle(e.order(cancel.label)->cycle)->take && take.total == 1,
+            "Raced fill receives its original take before further cancellation"); ack(e, take);
+        finishActions(e);
+        e.apply(snapshot(*e.order(take.label), take.total, true, 10));
+        const auto resize = finishActions(e);
+        for (const auto& action : resize) check(e.cycle(e.order(action.label)->cycle)->side == side, "Transition release resizes only its side");
+        check(e.transitionSlots(side) == 3 && !e.transitioning(side), "Selected old slot is released normally");
+        verifyTotals(e);
+    }
+}
+void selectiveRebuildKeepsExistingOppositeTransition() {
+    for (const auto oldSide : {Side::Long, Side::Short}) {
+        auto e = setup(3, true); finishActions(e);
+        Order entry;
+        for (const auto& o : e.orders()) if (e.cycle(o.cycle)->side == oldSide && entry.label.empty()) entry = o;
+        e.apply(snapshot(entry, 2, false, 2));
+        const auto take = requireAction(e, Mutation::Create, Role::Take); ack(e, take);
+        e.requestRebuild(e.config); finishActions(e);
+        check(e.transitioning(oldSide) && e.transitionSlots(oldSide) == 2, "Fixture has an old positioned cycle");
+        const auto index = static_cast<size_t>(oldSide); const auto floor = e.rebuildFloor[index];
+        const auto lattice = levelsFor(e.lattice, oldSide);
+        auto next = e.config; (oldSide == Side::Long ? next.shorts : next.longs).budget += 100 * Dollars;
+        e.requestRebuild(next, true); const auto actions = finishActions(e);
+        for (const auto& action : actions) check(e.cycle(e.order(action.label)->cycle)->side != oldSide, "Apply leaves the opposite ongoing transition intact");
+        check(e.rebuildFloor[index] == floor && levelsFor(e.lattice, oldSide) == lattice && e.transitionSlots(oldSide) == 2,
+            "Old cycle boundary, denominator and levels survive an opposite Apply");
+        e.apply(snapshot(*e.order(take.label), take.total, true, 10));
+        const auto resized = finishActions(e);
+        for (const auto& action : resized) check(e.cycle(e.order(action.label)->cycle)->side == oldSide, "Old take release does not resize the other updated side");
+        check(!e.transitioning(oldSide) && e.transitionSlots(oldSide) == 3, "Unchanged transition completes normally");
+    }
+}
+void selectiveRebuildDisableAndRepeatApply() {
+    auto e = setup(3, true); finishActions(e);
+    auto next = e.config; next.longs.budget = 0;
+    e.requestRebuild(next, true); auto actions = finishActions(e);
+    check(actions.size() == 3 && levelsFor(e.lattice, Side::Long).empty(), "Disabling a side cancels only its entries");
+    check(e.occupiedSlots(Side::Short) == 3, "Disabling Long retains Short");
+    next.longs.budget = 850 * Dollars; e.requestRebuild(next, true); actions = finishActions(e);
+    check(actions.size() == 3 && e.occupiedSlots(Side::Long) == 3, "Enabling a side places only its entries");
+    next = e.config; next.longs.levels = 4;
+    e.requestRebuild(next, true); const auto cancel = requireAction(e, Mutation::Cancel, Role::Entry); ack(e, cancel);
+    check(e.requestRebuild(e.config, true) == 1, "Reverting an in-progress Apply still completes only its accepted side");
+    actions = finishActions(e);
+    for (const auto& action : actions) check(e.cycle(e.order(action.label)->cycle)->side == Side::Long, "Repeated Apply retains the other side");
+    check(e.occupiedSlots(Side::Long) == 3 && !e.rebuilding, "Reverted settings restore the selected allocation");
+    next = e.config; ++next.longs.levels; ++next.shorts.levels;
+    check(e.requestRebuild(next, true) == 3, "Changing both sides selects both"); finishActions(e);
+    check(e.occupiedSlots(Side::Long) == 4 && e.occupiedSlots(Side::Short) == 4, "Both changed grids receive their new allocations");
+    check(e.requestRebuild(e.config) == 3, "Start/Resume remains an explicit full rebuild");
+    actions = finishActions(e); check(actions.size() == 16, "Full rebuild replaces both sets of entries");
 }
 void pricesAndCaps() {
     auto e = setup(10, true); auto a = requireAction(e, Mutation::Create, Role::Entry);
@@ -380,6 +522,7 @@ void manualTakesKeepPriority() {
 }
 int main() {
     try {
+        selectiveSettingsRebuild(); selectiveRebuildRacesAndTransitions(); selectiveRebuildDisableAndRepeatApply(); selectiveRebuildKeepsExistingOppositeTransition();
         rangeTransition(); lateFillAfterRestoringSameCycle(); malformedIdentityDoesNotMutateInventory(); lateFillAfterGridCommit(); autoRebuildProtectsRacedFills(); exactArithmeticAndSlots(); pricesAndCaps(); partialAndDuplicate(); partialTakeReentry(); rebuildAndOldSlots();
         limitsAndUncertainty(); switchingAndConflicts(); denseAndGap(); takePriorityAndSmallerSlotLimit(); simultaneousGridsSurviveFastQuotes(); manualPositionRecovery(); manualTakesKeepPriority();
         std::cout << "PASS: " << checks << " grid checks\n"; return EXIT_SUCCESS;
