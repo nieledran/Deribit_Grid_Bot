@@ -68,7 +68,5 @@ Then run `start.cmd`. Build details and portable packaging: [docs/BUILDING.md](d
 [MIT](LICENSE) — nieledran (Dan Rosenberg d. R.). Dependencies retain their own
 licenses; see [THIRD_PARTY.md](THIRD_PARTY.md) and [licenses/](licenses/).
 
-**Warning**
-
 > [!CAUTION]
 > This codebase was fully AI-written, model: GPT 6.1 sol (high).
