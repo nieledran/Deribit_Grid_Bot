@@ -31,7 +31,7 @@ Keep its EXE, DLLs, plugins, and launcher together. Launch again for the other i
 There are no stop-losses; the bot was designed for use with options. Production trades real funds, and testnet is simulated.
 
 **UI and in-work**
-![Bot interface, the Apply Settings button is blue because the bot is in the process of rebuilding the grid to an updated one.](<img width="1247" height="874" alt="image" src="https://github.com/user-attachments/assets/611aa9f7-4c2f-437f-9dae-b62cd69600b2" />
+![Bot interface, the Apply Settings button is blue because the bot is in the process of rebuilding the grid to an updated one.](png/bot_ui.png
 )
 ![Bot running on Deribit, two sides with middle of $84500 on BTC.](<img width="943" height="473" alt="image" src="https://github.com/user-attachments/assets/72a10560-1e76-48cf-af1c-db81579f00c7" />
 )
