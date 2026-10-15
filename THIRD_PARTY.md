@@ -1,13 +1,34 @@
 # Third-party components
 
-DeribitGrid links dynamically to Qt 6 (Core, GUI, Widgets, Network, WebSockets, SQL). The SQLite driver is supplied by Qt. Qt libraries retain their original licences and notices; this project does not modify them.
+Deribit Grid's own code is MIT licensed; see `LICENSE`.
 
-The local build uses Qt 6.8.3, downloaded from official Qt distribution mirrors with aqtinstall. aqtinstall and Python are build tools and are not used by the trading executable.
+## Qt 6.8.3
 
-Before redistributing a build, provide the required Qt licence texts, notices and corresponding source/access to source for the exact Qt version, or use an appropriate commercial Qt licence. See [Qt licensing](https://www.qt.io/licensing/open-source-lgpl-obligations) and [Qt 6.8 sources](https://download.qt.io/archive/qt/6.8/6.8.3/single/).
+The Windows release dynamically links unmodified Qt Core, GUI, Widgets, Network,
+WebSockets and SQL libraries, including the SQLite driver and deployment plugins.
+Qt is copyright The Qt Company Ltd. and other contributors. This distribution
+uses Qt under LGPL v3; Qt and its bundled components retain their own licenses.
+Users may replace compatible Qt DLLs, and reverse engineering for debugging
+modifications to the LGPL libraries is permitted.
 
-The AntonioVentilii Python deribit-wrapper is not bundled, imported or linked.
+The portable ZIP includes Qt license texts in `licenses/Qt-6.8.3/`, the supplied
+software bills of materials in `sbom/`, and the complete corresponding QtBase and
+QtWebSockets source archives in `sources/`. These archives also contain upstream
+third-party notices and build instructions. Qt source is available separately at
+[the official 6.8.3 archive](https://download.qt.io/archive/qt/6.8/6.8.3/submodules/).
+See [Qt licensing](https://doc.qt.io/qt-6.8/licensing.html).
 
-Boost.Multiprecision 1.89.0 is used as a header-only dependency for checked fixed-width integer arithmetic. Install the pinned headers with `python scripts/dependencies.py`. The Boost Software License is supplied in `licenses/Boost-1.89.0.txt` and copied into the distribution. No Boost DLLs are required.
+## Boost 1.89.0
 
-State JSON uses the Qt Core JSON implementation already supplied with the application.
+Boost.Multiprecision supplies checked integer arithmetic as a header-only dependency.
+The Boost Software License is retained in `licenses/Boost-1.89.0.txt` and the ZIP.
+No Boost DLLs are required.
+
+## Microsoft runtime
+
+The Windows ZIP includes Microsoft Visual C++ runtime and Direct3D compiler DLLs
+supplied through the Visual Studio/Qt deployment tools. These remain Microsoft's
+components under their respective redistribution terms, rather than the project's MIT license.
+
+Python and aqtinstall are build/setup tools and are not required by the executable.
+The Python deribit-wrapper is not used or bundled.
