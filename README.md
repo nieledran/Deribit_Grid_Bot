@@ -22,13 +22,19 @@ Keep its EXE, DLLs, plugins, and launcher together. Launch again for the other i
 - Profiles are saved beside the EXE in `profiles/`, separately for each instrument/environment. They connect your inventory to its takes. 
 - API secrets are kept in local memory only.
 - Reconnects reconcile orders and positions before resuming. A new application run starts paused.
-  Accepted orders remain on the exchange during a disconnect; new fills cannot receive takes while offline. You can turn Auto CoD (cancel on disconnect) when setting API key up on deribit, then all orders will be cancelled once disconnect happens.
+  Accepted orders remain on the exchange during a disconnect; new fills cannot receive takes while offline. You can turn Auto CoD (cancel on disconnect) on when setting API key up on Deribit, then all orders will be cancelled once a disconnect happens.
 - **Approx. P&L** uses grid entry/take prices and filled quantity, excluding fees and funding.
   **Fees** uses actual entry/take commissions, including rebates; missing data is marked incomplete.
-  Partial take fills count immediately; a fully filled take counts as one closed trade.
-  Counters reset on exit or **Reset stats**; missed fills are included during recovery. Overnight or orders completed while bot was turned off will be counted next time when you connect bot to deribit.
+  Partial take fills count immediately; a filled take counts as one closed trade.
+  Counters reset on exit or **Reset stats**; missed fills are included during recovery. Overnight or orders completed while the bot was turned off will be counted next time you connect the bot to Deribit.
 
-There is no stop-losses, bot was designed for use with options; Production trades real funds, and testnet simulated.
+There are no stop-losses; the bot was designed for use with options. Production trades real funds, and testnet is simulated.
+
+**UI and in-work**
+![Bot interface, the Apply Settings button is blue because the bot is in the process of rebuilding the grid to an updated one.](<img width="1247" height="874" alt="image" src="https://github.com/user-attachments/assets/611aa9f7-4c2f-437f-9dae-b62cd69600b2" />
+)
+![Bot running on Deribit, two sides with middle of $84500 on BTC.](<img width="943" height="473" alt="image" src="https://github.com/user-attachments/assets/72a10560-1e76-48cf-af1c-db81579f00c7" />
+)
 
 **Performance**
 
